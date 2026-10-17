@@ -1,0 +1,596 @@
+import { Check, ChevronDown, Folder, FolderOpen, FolderPlus, LoaderCircle, SendArrow } from "./icons.js";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import type { AgentModel, AgentModelRef, AgentReasoningLevel, ConversationCapabilities, PluginMention, ProjectState, ProjectType, PromptAttachment, PromptImage, PromptMode } from "../shared/contracts.js";
+import { clampReasoningLevel } from "../shared/reasoning.js";
+import { preferredAgentModel } from "../shared/agent-models.js";
+import { createConversation, createProject, getHomeComposerCapabilities, listProjects, updateAgentDefaults, waitForRuntime } from "./api.js";
+import { AttachmentStrip, appendAttachments, attachmentFiles, uploadAttachments, type ComposerAttachment } from "./composer-attachments.js";
+import { ModelSelector, useAgentModels } from "./model-selector.js";
+import { matchesPlanCommand, PlanModeIndicator } from "./plan-mode-control.js";
+import { PromptBox, type DroppedFile } from "./prompt-box.js";
+import { PROJECT_TYPES, ProjectTypeIcon, type ProjectTypeOption } from "./project-types.js";
+import { useComposerContextMenu } from "./composer-context-menu.js";
+import { activePluginMentions, extractLeadingPluginMention, formatComposerInvocation, formatSkillInvocation, insertMention, parseSkillInvocation, toPluginMention, type ComposerMention, type ComposerMentionQuery } from "./composer-mentions.js";
+import { createPromptHistory, loadHomePromptHistory, nextPrompt, previousPrompt, saveHomePrompt } from "./prompt-history.js";
+import { ComposerCapabilityReferences } from "./composer-capability-references.js";
+import { t } from "./i18n.js";
+
+const EMPTY_CAPABILITIES: ConversationCapabilities = { plugins: [], skills: [] };
+
+export function ProjectPromptCreator({ projectType, projectTypes = PROJECT_TYPES, placeholder, onProjectTypeChange, onOpenProject, onCreate }: {
+  projectType: ProjectType;
+  projectTypes?: readonly ProjectTypeOption[];
+  placeholder: string;
+  onProjectTypeChange?: (type: ProjectType) => void;
+  onOpenProject?: (projectId: string) => void;
+  onCreate: (project: ProjectState, conversationId: string, prompt: string, mentions: PluginMention[], images: PromptImage[], mode: PromptMode, attachments?: PromptAttachment[]) => void;
+}) {
+  const [prompt, setPrompt] = useState("");
+  const [selectedSkill, setSelectedSkill] = useState<string>();
+  const [selectedPlugin, setSelectedPlugin] = useState<PluginMention>();
+  const [pluginMentions, setPluginMentions] = useState<PluginMention[]>([]);
+  const [capabilities, setCapabilities] = useState(EMPTY_CAPABILITIES);
+  const [mentionCursor, setMentionCursor] = useState(0);
+  const [planning, setPlanning] = useState(false);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const created = useRef<{ project: ProjectState; conversationId?: string; workspacePath?: string } | undefined>(undefined);
+  const [creating, setCreating] = useState(false);
+  const [savingDefaults, setSavingDefaults] = useState(false);
+  const [error, setError] = useState<string>();
+  const [model, setModel] = useState<AgentModelRef>();
+  const [reasoningLevel, setReasoningLevel] = useState<AgentReasoningLevel>();
+  // Always starts as a new managed folder: remembering an external folder would point every new project at it.
+  const [workspacePath, setWorkspacePath] = useState<string>();
+  const [selectingWorkspace, setSelectingWorkspace] = useState(false);
+  const [existingProject, setExistingProject] = useState<ProjectState>();
+  const selectDirectory = window.ohMyGameDesktop?.selectProjectDirectory;
+  const [storedHistory] = useState(() => loadHomePromptHistory());
+  const [history, setHistory] = useState(() => createPromptHistory(storedHistory.map((entry) => entry.prompt)));
+  const mentionHistory = new Map(storedHistory.map((entry) => [entry.prompt, entry.mentions]));
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const modelCatalog = useAgentModels();
+  const selectedModel = preferredAgentModel(modelCatalog.models, model, modelCatalog.defaultModel);
+  const contextMenu = useComposerContextMenu({
+    prompt,
+    cursor: mentionCursor,
+    textarea: promptRef,
+    disabled: creating,
+    capabilities,
+    planning,
+    canTogglePlanning: !creating,
+    onFiles: addAttachments,
+    onTogglePlanning: () => togglePlanning(false),
+    onMention: selectMention,
+    onChange: changePrompt,
+    onSelectionChange: setMentionCursor,
+  });
+
+  useEffect(() => {
+    let disposed = false;
+    void waitForRuntime()
+      .then(() => getHomeComposerCapabilities())
+      .then((result) => { if (!disposed) setCapabilities(result); })
+      .catch((cause) => { if (!disposed) setError(errorMessage(cause)); });
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedModel) return;
+    const next = clampReasoningLevel(reasoningLevel ?? modelCatalog.defaultReasoningLevel, selectedModel.reasoningLevels);
+    if (next && next !== reasoningLevel) setReasoningLevel(next);
+  }, [selectedModel, modelCatalog.defaultReasoningLevel, reasoningLevel]);
+
+  async function submit(): Promise<void> {
+    if (matchesPlanCommand(prompt)) {
+      togglePlanning();
+      return;
+    }
+    const submittedPrompt = formatComposerInvocation(selectedSkill, selectedPlugin, prompt.trim());
+    if ((!submittedPrompt && attachments.length === 0) || creating) return;
+    setCreating(true);
+    setError(undefined);
+    try {
+      if (!created.current || created.current.project.type !== projectType || created.current.workspacePath !== workspacePath) {
+        created.current = { project: await createProject({ type: projectType, ...(workspacePath ? { workspacePath } : {}) }), workspacePath };
+      }
+      const project = created.current.project;
+      created.current.conversationId ??= (await createConversation(project.id)).id;
+      const uploaded = await uploadAttachments(project.id, crypto.randomUUID(), attachments);
+      const submittedMentions = activePluginMentions(submittedPrompt, pluginMentions);
+      saveHomePrompt({ prompt: submittedPrompt, mentions: submittedMentions });
+      onCreate(
+        project,
+        created.current.conversationId,
+        submittedPrompt,
+        submittedMentions,
+        [],
+        planning ? "planning" : "normal",
+        uploaded,
+      );
+    } catch (cause) {
+      setError(errorMessage(cause));
+      setCreating(false);
+    }
+  }
+
+  function addAttachments(next: ComposerAttachment[]): void {
+    setError(undefined);
+    try { setAttachments(appendAttachments(attachments, next)); }
+    catch (cause) { setError(errorMessage(cause)); }
+    promptRef.current?.focus();
+  }
+  function addFiles(files: DroppedFile[]): void { addAttachments(attachmentFiles(files)); }
+
+  async function saveDefaults(nextModel: AgentModelRef, nextReasoningLevel: AgentReasoningLevel): Promise<void> {
+    if (savingDefaults) return;
+    const modelRef = { provider: nextModel.provider, id: nextModel.id };
+    setSavingDefaults(true);
+    setError(undefined);
+    try {
+      await updateAgentDefaults({ model: modelRef, reasoningLevel: nextReasoningLevel });
+      setModel(modelRef);
+      setReasoningLevel(nextReasoningLevel);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSavingDefaults(false);
+    }
+  }
+
+  async function chooseWorkspace(): Promise<void> {
+    if (!selectDirectory) return;
+    setSelectingWorkspace(true);
+    setError(undefined);
+    setExistingProject(undefined);
+    try {
+      const selected = await selectDirectory();
+      if (!selected) return;
+      const owner = (await listProjects()).find((project) => project.workspacePath === selected);
+      if (owner) {
+        setExistingProject(owner);
+        return;
+      }
+      setWorkspacePath(selected);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSelectingWorkspace(false);
+    }
+  }
+
+  function resetWorkspace(): void {
+    setWorkspacePath(undefined);
+    setExistingProject(undefined);
+    setError(undefined);
+  }
+
+  function changeModel(nextModel: AgentModel): void {
+    const nextReasoningLevel = clampReasoningLevel(reasoningLevel ?? modelCatalog.defaultReasoningLevel, nextModel.reasoningLevels);
+    void saveDefaults(nextModel, nextReasoningLevel);
+  }
+
+  function togglePlanning(clearDraft = true): void {
+    setPlanning((value) => !value);
+    if (clearDraft) {
+      setPrompt("");
+      setSelectedSkill(undefined);
+      setSelectedPlugin(undefined);
+      setPluginMentions([]);
+      setMentionCursor(0);
+    }
+    if (!planning) setSelectedSkill(undefined);
+    promptRef.current?.focus();
+  }
+
+  function changePrompt(value: string): void {
+    setPrompt(value);
+    setPluginMentions((current) => activePluginMentions(formatComposerInvocation(selectedSkill, selectedPlugin, value), current));
+    setHistory((current) => current.index === current.entries.length
+      ? current
+      : { ...current, index: current.entries.length, draft: formatComposerInvocation(selectedSkill, selectedPlugin, value) });
+  }
+
+  function browseHistory(direction: "previous" | "next"): void {
+    const result = direction === "previous" ? previousPrompt(history, formatComposerInvocation(selectedSkill, selectedPlugin, prompt)) : nextPrompt(history);
+    if (!result) return;
+    const skill = parseSkillInvocation(result.prompt);
+    const historicalMentions = mentionHistory.get(result.prompt) ?? [];
+    const plugin = extractLeadingPluginMention(skill?.prompt ?? result.prompt, historicalMentions);
+    setHistory(result.history);
+    setPrompt(plugin.prompt);
+    setSelectedSkill(skill?.name);
+    setSelectedPlugin(plugin.mention);
+    setPluginMentions(historicalMentions);
+    const cursor = plugin.prompt.length;
+    setMentionCursor(cursor);
+    requestAnimationFrame(() => {
+      promptRef.current?.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  function clearSelectedPlugin(): void {
+    setSelectedPlugin(undefined);
+    setPluginMentions((current) => activePluginMentions(formatSkillInvocation(selectedSkill, prompt), current));
+  }
+
+  function selectMention(mention: ComposerMention, query?: ComposerMentionQuery): void {
+    const activeMention = query ?? { start: mentionCursor, end: mentionCursor, trigger: "@" as const, query: "" };
+    if (mention.type === "skill") {
+      if (query) {
+        const suffix = prompt.slice(activeMention.end).replace(/^\s+/, "");
+        setPrompt(`${prompt.slice(0, activeMention.start)}${suffix}`);
+      }
+      setSelectedSkill(mention.value.name);
+      setMentionCursor(activeMention.start);
+      focusAt(activeMention.start);
+      return;
+    }
+    const selected = toPluginMention(mention.value);
+    if ((!query || activeMention.start === 0) && !selectedPlugin) {
+      const nextPrompt = query ? prompt.slice(activeMention.end).replace(/^\s+/, "") : prompt;
+      const candidates = [
+        ...pluginMentions.filter((item) => item.name !== selected.name || item.marketplaceId !== selected.marketplaceId),
+        selected,
+      ];
+      setPrompt(nextPrompt);
+      setSelectedPlugin(selected);
+      setPluginMentions(activePluginMentions(formatComposerInvocation(selectedSkill, selected, nextPrompt), candidates));
+      setMentionCursor(0);
+      focusAt(0);
+      return;
+    }
+    const inserted = insertMention(prompt, activeMention, mention);
+    changePrompt(inserted.value);
+    setPluginMentions((current) => [
+      ...current.filter((item) => item.name !== selected.name || item.marketplaceId !== selected.marketplaceId),
+      selected,
+    ]);
+    setMentionCursor(inserted.cursor);
+    focusAt(inserted.cursor);
+  }
+
+  function focusAt(cursor: number): void {
+    requestAnimationFrame(() => {
+      promptRef.current?.focus();
+      promptRef.current?.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  function handleCommandKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): boolean {
+    setMentionCursor(event.currentTarget.selectionStart);
+    if (contextMenu.handleKeyDown(event)) return true;
+    if (selectedSkill && event.key === "Backspace" && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) {
+      event.preventDefault();
+      setSelectedSkill(undefined);
+      return true;
+    }
+    if (selectedPlugin && event.key === "Backspace" && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) {
+      event.preventDefault();
+      clearSelectedPlugin();
+      return true;
+    }
+    return false;
+  }
+
+  return (
+    <>
+      <PromptBox
+        actions={(
+          <>
+            <ModelSelector
+              placement="below"
+              models={modelCatalog.models}
+              status={modelCatalog.status}
+              value={selectedModel}
+              reasoningLevel={reasoningLevel}
+              disabled={creating || savingDefaults}
+              onChange={changeModel}
+              onReasoningChange={(next) => { if (selectedModel) void saveDefaults(selectedModel, next); }}
+            />
+            <button
+              className="icon-button send-button"
+              type="submit"
+              disabled={(!selectedSkill && !selectedPlugin && !prompt.trim() && attachments.length === 0) || creating}
+              title={t("creator.create")}
+              aria-label={t("creator.create")}
+            >
+              {creating ? <LoaderCircle className="spin" size={15} /> : <SendArrow size={15} />}
+            </button>
+          </>
+        )}
+        content={<AttachmentStrip items={attachments} onRemove={(id) => setAttachments((items) => items.filter((attachment) => attachment.id !== id))} />}
+        disabled={creating}
+        prefix={<ComposerCapabilityReferences
+          skill={selectedSkill}
+          plugin={selectedPlugin}
+          onRemoveSkill={() => {
+            setSelectedSkill(undefined);
+            promptRef.current?.focus();
+          }}
+          onRemovePlugin={() => {
+            clearSelectedPlugin();
+            promptRef.current?.focus();
+          }}
+        />}
+        leading={(
+          <>
+            {contextMenu.button}
+            {selectDirectory ? (
+              <WorkspaceSelector
+                value={workspacePath}
+                disabled={creating || selectingWorkspace}
+                onChoose={() => void chooseWorkspace()}
+                onUseManaged={resetWorkspace}
+              />
+            ) : null}
+            {onProjectTypeChange ? <ProjectTypeSelector disabled={creating} value={projectType} options={projectTypes} onChange={onProjectTypeChange} /> : null}
+            {planning ? <PlanModeIndicator disabled={creating} onExit={() => togglePlanning()} /> : null}
+          </>
+        )}
+        onChange={changePrompt}
+        onCommandKeyDown={handleCommandKeyDown}
+        onHistoryNext={() => browseHistory("next")}
+        onHistoryPrevious={() => browseHistory("previous")}
+        onSubmit={() => void submit()}
+        suggestions={contextMenu.suggestions}
+        overlay={contextMenu.open ? contextMenu.overlay : null}
+        placeholder={selectedSkill || selectedPlugin ? "" : planning ? t("creator.planPlaceholder") : placeholder}
+        textareaRef={promptRef}
+        onSelectionChange={setMentionCursor}
+        value={prompt}
+        variant="home"
+        onDropFiles={creating ? undefined : addFiles}
+        onDropError={(cause) => setError(cause.message)}
+      />
+      {existingProject ? (
+        <p className="home-notice" role="alert">
+          {t("creator.folderInUse", { name: existingProject.name })}
+          {onOpenProject ? <button type="button" onClick={() => onOpenProject(existingProject.id)}>{t("creator.openProject")}</button> : null}
+        </p>
+      ) : null}
+      {error ? <p className="home-notice" role="alert">{error}</p> : null}
+    </>
+  );
+}
+
+function WorkspaceSelector({ value, disabled, onChoose, onUseManaged }: {
+  value?: string;
+  disabled?: boolean;
+  onChoose: () => void;
+  onUseManaged: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+  const folderName = value ? workspaceFolderName(value) : undefined;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (open) menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus();
+  }, [open]);
+
+  function close(): void {
+    setOpen(false);
+    trigger.current?.focus();
+  }
+
+  return (
+    <div className="home-project-type-selector" ref={root}>
+      <button
+        ref={trigger}
+        className="home-project-type-trigger home-workspace-trigger"
+        type="button"
+        aria-controls={menuId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={value ? t("creator.workspaceValue", { path: value }) : t("creator.workspaceNew")}
+        title={value ?? t("creator.workspaceNewTitle")}
+        disabled={disabled}
+        onClick={() => setOpen((currentOpen) => !currentOpen)}
+      >
+        {value ? <Folder size={14} /> : <FolderPlus size={14} />}
+        <span>{folderName ?? t("creator.newFolder")}</span>
+        <ChevronDown size={12} aria-hidden="true" />
+      </button>
+      {open ? (
+        <div
+          ref={menu}
+          className="home-project-type-menu home-workspace-menu"
+          id={menuId}
+          role="menu"
+          aria-label={t("creator.workspace")}
+          onKeyDown={(event) => {
+            if (event.key === "Tab") {
+              setOpen(false);
+              return;
+            }
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button")];
+            const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+            const nextIndex = event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? items.length - 1
+                : (currentIndex + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+            items[nextIndex]?.focus();
+          }}
+        >
+          <button
+            className={value ? undefined : "is-active"}
+            type="button"
+            role="menuitemradio"
+            aria-checked={!value}
+            onClick={() => {
+              onUseManaged();
+              close();
+            }}
+          >
+            <FolderPlus size={14} aria-hidden="true" />
+            <span>{t("creator.newFolder")}</span>
+            {value ? null : <Check size={13} aria-hidden="true" />}
+          </button>
+          {value ? (
+            <button className="is-active" type="button" role="menuitemradio" aria-checked="true" title={value} onClick={close}>
+              <Folder size={14} aria-hidden="true" />
+              <span>{folderName}</span>
+              <Check size={13} aria-hidden="true" />
+            </button>
+          ) : null}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onChoose();
+            }}
+          >
+            <FolderOpen size={14} aria-hidden="true" />
+            <span>{value ? t("creator.chooseAnother") : t("creator.chooseFolder")}</span>
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function workspaceFolderName(workspacePath: string): string {
+  const trimmed = workspacePath.replace(/[\\/]+$/, "");
+  return trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1) || workspacePath;
+}
+
+function ProjectTypeSelector({ value, options, disabled, onChange }: {
+  value: ProjectType;
+  options: readonly ProjectTypeOption[];
+  disabled?: boolean;
+  onChange: (value: ProjectType) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+  const current = options.find((option) => option.value === value)!;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (open) menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus();
+  }, [open]);
+
+  return (
+    <div className="home-project-type-selector" ref={root}>
+      <button
+        ref={trigger}
+        className="home-project-type-trigger"
+        type="button"
+        aria-controls={menuId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        disabled={disabled}
+        onClick={() => setOpen((currentOpen) => !currentOpen)}
+      >
+        <ProjectTypeIcon type={current.value} />
+        <span>{current.label}</span>
+        <ChevronDown size={12} aria-hidden="true" />
+      </button>
+
+      {open ? (
+        <div
+          ref={menu}
+          className="home-project-type-menu"
+          id={menuId}
+          role="menu"
+          aria-label={t("creator.projectType")}
+          onKeyDown={(event) => {
+            if (event.key === "Tab") {
+              setOpen(false);
+              return;
+            }
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')];
+            const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+            const nextIndex = event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? items.length - 1
+                : (currentIndex + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+            items[nextIndex]?.focus();
+          }}
+        >
+          {options.map((option) => {
+            const selected = option.value === value;
+            return (
+              <button
+                className={selected ? "is-active" : undefined}
+                type="button"
+                role="menuitemradio"
+                aria-checked={selected}
+                key={option.value}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                  trigger.current?.focus();
+                }}
+              >
+                <ProjectTypeIcon type={option.value} />
+                <span>{option.label}</span>
+                {selected ? <Check size={13} aria-hidden="true" /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}

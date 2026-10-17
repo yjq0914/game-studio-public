@@ -1,0 +1,163 @@
+# Canvas And The Agent
+
+Design and Asset Canvas share a project directory the agent edits with its ordinary file tools.
+The canvas renders those files and autosaves user edits into the same sources.
+The agent can initialize a canvas when design or asset work needs it, without
+requiring the user to open Design first.
+
+```text
+canvas/
+  AGENTS.md
+  README.md
+  index.json
+  boards/<board-id>.json
+  documents/<document-id>.md
+  tables/<table-id>.json
+  assets.json
+  editor/<board-id>.json
+  schemas/{index,board,layout,assets,table}.schema.json
+  jobs.json
+assets/
+```
+
+`index.json` names boards, documents and optional tables. A board contains stable node IDs,
+optional `title` and `description`, content, and references. Markdown bodies
+are shared between document nodes. Connections for prompts and media are
+derived from `promptSource`, `images`, `references`, and `source`.
+
+Generation nodes use these semantic board fields (runtime state and visual size
+do not belong in the board file):
+
+- `speech`: `text`, optional `promptSource`, `model`, `voiceId`, `speed`, and
+  generated `assetId`;
+- `sound-effect`: `prompt`, optional `promptSource`, `model`, `durationSeconds`,
+  `loop`, `negativePrompt`, and generated `assetId`;
+- `music`: `prompt`, `instrumental`, optional `promptSource`, `model`, `lyrics`,
+  `durationSeconds`, `loop`, and generated `assetId`.
+
+The editor's Add menu and the agent's active tools expose an audio operation only
+when the current audio catalog has a configured, enabled model advertising that
+operation. Existing nodes remain valid if that provider later becomes unavailable.
+
+Text and Document nodes accept up to 14 connected Text, Document, Image or image
+Asset nodes in `references` (`{ "type": "node", "nodeId": "..." }`). These
+connections supply source material to AI generation. Connecting an image to a
+Document adds a generation reference; use Insert image to put it in the Markdown.
+Generation saves the current board and documents first, then reads the referenced
+nodes' saved text, Markdown and actual image output from the workspace. Image
+references require a language model that accepts images. A node cannot reference
+itself or, for Document nodes, another node pointing to the same document.
+
+Positions, zoom and the width/height of text, document and table nodes live in
+`editor/`. Media and generation nodes size to their content: the editor ignores
+a width/height on them and canvas_check reports it. New nodes get positions
+automatically.
+The agent usually edits only the semantic files. Deleting a board or node
+keeps its documents, tables and media.
+
+Table nodes reference `tableId`; the JSON table is shared across boards. Each
+column has a stable ID, title, type (`text`, `number`, `boolean`) and optional
+width. Each row has a stable ID and `cells` keyed by column ID. Missing cells
+and `null` mean empty. Keep IDs stable when changing data. Tables support up to
+1,000 rows and 100 columns. Different cells merge independently; competing
+cell edits, deletion versus editing, or incompatible type changes require a
+version choice. Invalid or removed files preserve unsaved local table drafts.
+
+The editor supports wrapping cells, fixed headers, column resizing, table
+undo/redo, CSV import/export and rectangular TSV paste from spreadsheets. CSV
+imports replace the contents and keep values as text to preserve leading zeros;
+change column types explicitly when needed. Table undo is separate from board
+layout undo. Text, document and table nodes can be resized in pointer mode,
+reset to their default size, or opened for expanded editing.
+
+Table cards show a read-only preview with the same header, reading frame and
+footer as document nodes. Edit opens the expanded spreadsheet; Expand opens a
+larger preview with an edit toggle. Selected nodes and expanded tables share an
+AI instruction composer and model settings. Complete, validated AI output is
+applied only when the saved source is unchanged. Otherwise it remains a candidate
+for explicit adoption. Invalid or incomplete output preserves the table, and AI
+instructions and valid candidates survive reloads. Adopting an AI draft is one
+table undo step.
+
+`assets.json` maps asset IDs to readable names and project-relative paths.
+Descriptions describe purpose; prompts record generation instructions.
+Neither is a verified description of image pixels. The agent reads local
+images when it needs to inspect appearance. The shared canvas reference type
+`library` resolves through this project manifest; `libraryAssetId`
+records the origin of an imported or generated file.
+
+The editor supplies the current board path and selected node IDs as a
+removable chat context. The agent reads current files before making changes.
+Concurrent edits to different fields merge; competing edits require the user
+to choose a version. Invalid external edits leave the last valid canvas
+visible with diagnostics. External node changes enter the canvas undo history.
+
+Asset Canvas has **Canvas** and **Code** navigation. Code shows the workspace
+files and stays accessible when canvas loading or saving fails. Switching
+views keeps the canvas session, document generation state and local drafts.
+
+Missing media files do not prevent the workspace from opening or the board
+from being saved. The affected node keeps its ID and references, shows the
+missing path, and can check the file again. Restoring the file also refreshes
+its preview automatically. Generation, image insertion and export validate
+the files needed for that operation; unrelated missing assets do not block it.
+Deleting a node keeps the resource registration and file for reuse and undo.
+An unused registration for a missing file does not block the editor. Remove
+such a registration only after checking other boards and document links.
+`canvas_check` still reports missing files as diagnostics.
+
+Loading, background synchronization and saving have separate recovery actions.
+An initial load failure can reload the canvas. A failed background read keeps
+the last valid board interactive and retries synchronization. A failed save
+keeps the local recovery draft and can retry saving. Competing edits show
+version choices without covering the canvas; choosing a version runs through
+the same serialized storage session as saving and synchronization. Missing
+document files or index entries also preserve unsaved Markdown drafts until
+their sources are restored.
+
+Document AI generation saves complete output only when the source document has
+not changed. Truncated or interrupted text stays in an editable candidate draft,
+with the specific failure reason, and never replaces the document automatically.
+Candidates can be copied, discarded or explicitly adopted through the normal save
+flow. Instructions, model settings and candidates are kept locally across reloads.
+Retrying keeps the current candidate until another text result arrives; retry
+results also require review. Responses with no document text preserve the document
+and instruction and allow retrying or choosing another model. Thinking and tool
+output are never used as document Markdown.
+
+Three tools supplement ordinary file editing:
+
+- `canvas_initialize` creates the file contract and an empty board on demand,
+  preserving existing content. It is unavailable in planning mode.
+- `canvas_check` validates schemas, document/table references, asset paths and media
+  types. It is read-only and available in planning mode.
+- `generate_canvas_media(boardId, nodeId)` executes the saved node settings
+  when generation is requested, including necessary media for a game-creation
+  request unless the user limits its scope. It shares canvas jobs, cancellation and
+  history, materializes output in the project, and writes the output ID back
+  to the node. Changing a file does not start generation.
+
+## Migrating Existing Projects
+
+Stop OhMyGame, then run the migration against its data directory:
+
+```sh
+bun scripts/migrate-canvas-workspaces.ts .data
+```
+
+The script backs up old Design directories and Asset Canvas files under
+`<data-directory>/canvas-backups/`, separates layout files and materializes
+Library references. IDs, Markdown, media and layout are preserved. It leaves
+current projects alone. The application only reads the current format.
+
+Both editors share nodes, documents, metadata, generation, history, clipboard,
+file uploads and external file synchronization. Asset Canvas uses one default
+board and retains automatic covers and sending assets to projects. Game
+projects expose multiple boards and an optional main game design document.
+
+Hold Option (Alt on Windows and Linux) when starting a node drag to pull out
+copies. Copies keep node content and Library resources, use new IDs, and drop
+all connections, including connections within a copied selection. The originals
+stay in place. Releasing at the starting position cancels the copies; a completed
+drag is one board undo step. If the copies would exceed the 2,000-node limit,
+the editor rejects the drag and keeps the originals in place.

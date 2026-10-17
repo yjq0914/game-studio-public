@@ -1,0 +1,19 @@
+{
+  "name": "godot",
+  "version": "0.1.0",
+  "description": "Connect OhMyGame to the Godot editor.",
+  "interface": {
+    "displayName": "Godot",
+    "shortDescription": "Connect the agent to the Godot editor.",
+    "longDescription": "Use the Godot plugin to inspect scenes, edit scripts, create nodes, and control the running editor directly from OhMyGame.",
+    "defaultPrompt": [
+      "Create a playable 3D scene in Godot.",
+      "Inspect the current Godot project and suggest the next implementation step.",
+      "Build a player controller for the current Godot scene."
+    ],
+    "projectTypes": [
+      "godot-game"
+    ]
+  },
+  "mcpServers": "./mcp.json"
+}

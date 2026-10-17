@@ -1,0 +1,192 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { afterEach, describe, expect, it } from "vitest";
+import { takeAccessToken } from "../src/daemon/access-token.js";
+import { createApp } from "../src/daemon/app.js";
+import { LOCAL_DEBUG_ACCESS_TOKEN } from "../src/shared/local-debug.js";
+
+const apps: ReturnType<typeof createApp>[] = [];
+afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
+
+describe("desktop daemon access", () => {
+  it("protects health and project routes with the process token", async () => {
+    const app = createApp({
+      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")),
+      accessToken: "desktop-secret",
+    });
+    apps.push(app);
+
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(401);
+    expect((await app.inject({
+      method: "GET",
+      url: "/health",
+      headers: { authorization: "Bearer desktop-secret" },
+    })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/projects", payload: {} })).statusCode).toBe(401);
+    expect((await app.inject({
+      method: "POST",
+      url: "/projects",
+      headers: { authorization: "Bearer desktop-secret" },
+      payload: {},
+    })).statusCode).toBe(201);
+  });
+
+  it("rejects incorrect bearer tokens regardless of their length", async () => {
+    const app = createApp({
+      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")),
+      accessToken: "desktop-secret",
+    });
+    apps.push(app);
+
+    for (const token of ["desktop-secrex", "short", "desktop-secret-extra"]) {
+      const response = await app.inject({
+        method: "GET",
+        url: "/health",
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(response.statusCode).toBe(401);
+    }
+  });
+
+  it("allows only the configured renderer origin", async () => {
+    const app = createApp({
+      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")),
+      accessToken: "desktop-secret",
+      allowedOrigins: ["http://127.0.0.1:43120"],
+    });
+    apps.push(app);
+
+    const allowed = await app.inject({
+      method: "OPTIONS",
+      url: "/projects",
+      headers: {
+        origin: "http://127.0.0.1:43120",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization,content-type,x-workspace-version",
+      },
+    });
+    expect(allowed.statusCode).toBe(204);
+    expect(allowed.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:43120");
+    expect(String(allowed.headers["access-control-allow-headers"]).split(/\s*,\s*/)).toEqual(
+      expect.arrayContaining(["authorization", "content-type", "x-workspace-version", "x-publish-access-token"]),
+    );
+    expect(allowed.headers["access-control-expose-headers"]).toBe("x-workspace-version");
+
+    const rejected = await app.inject({
+      method: "OPTIONS",
+      url: "/projects",
+      headers: { origin: "https://untrusted.example" },
+    });
+    expect(rejected.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("preserves renderer CORS headers on the event stream", async () => {
+    const origin = "http://127.0.0.1:43120";
+    const app = createApp({
+      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-access-")),
+      accessToken: "desktop-secret",
+      allowedOrigins: [origin],
+    });
+    apps.push(app);
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const project = (await app.inject({
+      method: "POST",
+      url: "/projects",
+      headers: { authorization: "Bearer desktop-secret" },
+      payload: {},
+    })).json();
+    const controller = new AbortController();
+
+    const response = await fetch(`${address}/projects/${project.id}/events`, {
+      headers: {
+        accept: "text/event-stream",
+        authorization: "Bearer desktop-secret",
+        origin,
+      },
+      signal: controller.signal,
+    });
+
+    try {
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      expect(response.headers.get("access-control-allow-origin")).toBe(origin);
+    } finally {
+      await response.body?.cancel();
+      controller.abort();
+    }
+  });
+
+  it.each(["http://127.0.0.1:43120", "null"])("allows signed-in Community reads from the configured renderer origin %s", async (origin) => {
+    const app = createApp({
+      dataDirectory: await mkdtemp(path.join(tmpdir(), "ohmygame-community-cors-")),
+      accessToken: "desktop-secret",
+      allowedOrigins: [origin],
+      localDebug: true,
+    });
+    apps.push(app);
+
+    const preflight = await app.inject({
+      method: "OPTIONS",
+      url: "/community/games?metrics=true",
+      headers: {
+        origin,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization,x-publish-access-token",
+      },
+    });
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers["access-control-allow-origin"]).toBe(origin);
+    expect(String(preflight.headers["access-control-allow-headers"]).split(/\s*,\s*/)).toEqual(
+      expect.arrayContaining(["authorization", "x-publish-access-token"]),
+    );
+
+    const games = await app.inject({
+      method: "GET",
+      url: "/community/games?metrics=true",
+      headers: { origin, authorization: "Bearer desktop-secret", "x-publish-access-token": LOCAL_DEBUG_ACCESS_TOKEN },
+    });
+    expect(games.statusCode).toBe(200);
+    expect(games.headers["access-control-allow-origin"]).toBe(origin);
+    expect(games.json()).toEqual([]);
+    expect((await app.inject({ method: "GET", url: "/community/me/games", headers: { origin, "x-publish-access-token": LOCAL_DEBUG_ACCESS_TOKEN } })).statusCode).toBe(401);
+  });
+});
+
+describe("daemon access token", () => {
+  it("takes the token from stdin when the desktop app sends it there", async () => {
+    const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN_STDIN: "1", PATH: "/usr/bin" };
+    expect(await takeAccessToken(environment, Readable.from(["desktop-", "secret"]))).toBe("desktop-secret");
+    expect(environment).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("refuses to start without the token the desktop app said it would send", async () => {
+    const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN_STDIN: "1", OHMYGAME_DAEMON_TOKEN: "stale" };
+    await expect(takeAccessToken(environment, Readable.from([]))).rejects.toThrow("was not received");
+    expect(environment).toEqual({});
+  });
+
+  it("takes a token given in the environment and removes it from there", async () => {
+    const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN: "standalone-secret", PATH: "/usr/bin" };
+    expect(await takeAccessToken(environment, Readable.from(["ignored"]))).toBe("standalone-secret");
+    expect(environment).toEqual({ PATH: "/usr/bin" });
+    expect(await takeAccessToken({}, Readable.from([]))).toBeUndefined();
+  });
+
+  it("rejects oversized stdin tokens without falling back to the environment", async () => {
+    const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN_STDIN: "1", OHMYGAME_DAEMON_TOKEN: "stale" };
+    await expect(takeAccessToken(environment, Readable.from(["a".repeat(4_096), "b"]))).rejects.toThrow("too long");
+    expect(environment).toEqual({});
+  });
+
+  it("rejects a failed stdin stream without falling back to the environment", async () => {
+    const environment: NodeJS.ProcessEnv = { OHMYGAME_DAEMON_TOKEN_STDIN: "1", OHMYGAME_DAEMON_TOKEN: "stale" };
+    const input = Readable.from((async function* () {
+      yield "partial-token";
+      throw new Error("Token pipe failed");
+    })());
+    await expect(takeAccessToken(environment, input)).rejects.toThrow("Token pipe failed");
+    expect(environment).toEqual({});
+  });
+});

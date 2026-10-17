@@ -1,0 +1,296 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { startDaemon } from "../src/desktop/daemon-process.js";
+
+describe("desktop daemon process", () => {
+  it("resolves the system proxy over private child IPC", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-proxy-ipc-"));
+    const entry = path.join(directory, "daemon.mjs");
+    const resultFile = path.join(directory, "result.json");
+    const shutdownFile = path.join(directory, "shutdown");
+    await writeFile(
+      entry,
+      `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      const server = createServer((_request, response) => response.end());
+      process.on("message", (message) => {
+        if (message.channel === "ohmygame:system-proxy:result") writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify(message));
+        if (message.channel === "ohmygame:shutdown") server.close(() => {
+          writeFileSync(${JSON.stringify(shutdownFile)}, "closed");
+          process.exit(0);
+        });
+      });
+      process.send({ channel: "ohmygame:system-proxy:resolve", id: "test-proxy" });
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+      // This fixture can only close gracefully through IPC, as on Windows.
+      process.once("SIGTERM", () => {});
+    `);
+    const daemon = await startDaemon({ daemonEntry: entry, dataDirectory: directory, token: "test-token", allowedOrigins: [], executable: process.execPath, environment: {}, resolveSystemProxy: async () => "PROXY 127.0.0.1:7890" });
+    try {
+      await vi.waitFor(async () =>
+        expect(JSON.parse(await readFile(resultFile, "utf8"))).toEqual({
+          channel: "ohmygame:system-proxy:result",
+          id: "test-proxy",
+          result: "PROXY 127.0.0.1:7890",
+        }),
+      );
+    } finally {
+      await Promise.all([daemon.stop(), daemon.stop()]);
+      expect(await readFile(shutdownFile, "utf8")).toBe("closed");
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "stops a nonresponsive daemon's process tree on Windows",
+    async () => {
+      const directory = await mkdtemp(
+        path.join(tmpdir(), "ohmygame-daemon-tree-"),
+      );
+      const entry = path.join(directory, "daemon.mjs");
+      const descendantFile = path.join(directory, "descendant.pid");
+      await writeFile(
+        entry,
+        `
+      import { spawn } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      writeFileSync(${JSON.stringify(descendantFile)}, String(descendant.pid));
+      createServer((_request, response) => response.end()).listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+    `,
+      );
+      const daemon = await startDaemon({
+        daemonEntry: entry,
+        dataDirectory: directory,
+        token: "test-token",
+        allowedOrigins: [],
+        executable: process.execPath,
+        environment: {},
+      });
+      const descendantPid = Number(await readFile(descendantFile, "utf8"));
+      try {
+        expect(isRunning(descendantPid)).toBe(true);
+        await daemon.stop();
+        await vi.waitFor(() => expect(isRunning(descendantPid)).toBe(false));
+      } finally {
+        if (isRunning(descendantPid)) process.kill(descendantPid);
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("includes daemon output when the child exits before becoming healthy", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-desktop-error-"));
+    const entry = path.join(directory, "daemon.mjs");
+    await writeFile(entry, `
+      process.stderr.write("\\u001b[31mCould not read project metadata\\u001b[0m\\n");
+      process.exit(1);
+    `);
+
+    await expect(startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: {},
+      healthTimeoutMs: 2_000,
+    })).rejects.toThrow(
+      "Daemon exited before becoming ready (1)\n\nDaemon output:\nCould not read project metadata",
+    );
+  });
+
+  it.each([false, true])("waits for health and stops the managed child (development=%s)", async (development) => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-desktop-"));
+    const pidFile = path.join(directory, "pid");
+    const entry = path.join(directory, "daemon.mjs");
+    await writeFile(entry, `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+      let token = "";
+      for await (const chunk of process.stdin) token += chunk;
+      const server = createServer((request, response) => {
+        response.statusCode = request.url === "/health" && request.headers.authorization === "Bearer " + token ? 200 : 401;
+        response.end(JSON.stringify({ development: process.argv.includes("--dev"), tokenInEnvironment: Object.keys(process.env).some((name) => name.toUpperCase() === "OHMYGAME_DAEMON_TOKEN") }));
+      });
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `);
+
+    const daemon = await startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: { OHMYGAME_DAEMON_TOKEN: "stale-desktop-token", ohmygame_daemon_token: "stale-desktop-token" },
+      development,
+      healthTimeoutMs: 2_000,
+    });
+    const pid = Number(await readFile(pidFile, "utf8"));
+
+    try {
+      expect((await fetch(`${daemon.runtime.url}/health`)).status).toBe(401);
+      expect((await fetch(`${daemon.runtime.url}/health`, {
+        headers: { authorization: "Bearer test-token" },
+      })).status).toBe(200);
+      expect(daemon.runtime.token).toBe("test-token");
+      expect(await (await fetch(`${daemon.runtime.url}/health`, {
+        headers: { authorization: "Bearer test-token" },
+      })).json()).toEqual({ development, tokenInEnvironment: false });
+    } finally {
+      await daemon.stop();
+    }
+    await vi.waitFor(() => expect(isRunning(pid)).toBe(false));
+  });
+
+  it("prepends the packaged runtime to the daemon path", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-runtime-"));
+    const runtimeBin = path.join(directory, "runtime", "node", "bin");
+    const pathFile = path.join(directory, "path");
+    const entry = path.join(directory, "daemon.mjs");
+    await mkdir(runtimeBin, { recursive: true });
+    await writeFile(entry, `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      writeFileSync(${JSON.stringify(pathFile)}, process.env.Path ?? "");
+      const server = createServer((_request, response) => response.end());
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `);
+
+    const daemon = await startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: { Path: "/system/bin" },
+      runtimeBin,
+      healthTimeoutMs: 2_000,
+    });
+
+    expect(await readFile(pathFile, "utf8")).toBe(`${runtimeBin}${path.delimiter}/system/bin`);
+    await daemon.stop();
+  });
+
+  it("passes the OhMyGame Pi agent directory to the daemon", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-pi-agent-"));
+    const piAgentDirectory = path.join(directory, "pi-agent");
+    const piAgentFile = path.join(directory, "pi-agent-path");
+    const entry = path.join(directory, "daemon.mjs");
+    await writeFile(entry, `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      writeFileSync(${JSON.stringify(piAgentFile)}, process.env.PI_CODING_AGENT_DIR ?? "");
+      const server = createServer((_request, response) => response.end());
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `);
+
+    const daemon = await startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: {},
+      piAgentDirectory,
+      healthTimeoutMs: 2_000,
+    });
+
+    expect(await readFile(piAgentFile, "utf8")).toBe(piAgentDirectory);
+    await daemon.stop();
+  });
+
+  it("passes the packaged player directory to the daemon", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-player-path-"));
+    const playerDirectory = path.join(directory, "app.asar.unpacked", "dist", "player");
+    const playerPathFile = path.join(directory, "player-path");
+    const entry = path.join(directory, "daemon.mjs");
+    await writeFile(entry, `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      writeFileSync(${JSON.stringify(playerPathFile)}, process.env.OHMYGAME_PLAYER_DIR ?? "");
+      const server = createServer((_request, response) => response.end());
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1");
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `);
+
+    const daemon = await startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: {},
+      playerDirectory,
+      healthTimeoutMs: 2_000,
+    });
+
+    expect(await readFile(playerPathFile, "utf8")).toBe(playerDirectory);
+    await daemon.stop();
+  });
+
+  it("routes playtest requests over the private child-process channel", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "ohmygame-playtest-ipc-"));
+    const resultFile = path.join(directory, "playtest-result");
+    const entry = path.join(directory, "daemon.mjs");
+    await writeFile(entry, `
+      import { writeFileSync } from "node:fs";
+      import { createServer } from "node:http";
+      const server = createServer((_request, response) => response.end());
+      server.listen(Number(process.env.DAEMON_PORT), "127.0.0.1", () => {
+        process.send({
+          channel: "ohmygame:playtest-request",
+          id: "request-1",
+          request: { operation: "close", sessionId: "session-1" },
+        });
+      });
+      process.on("message", (message) => {
+        if (message?.channel === "ohmygame:playtest-response") writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify(message));
+        if (message?.channel === "ohmygame:shutdown") server.close(() => process.exit(0));
+      });
+      process.once("SIGTERM", () => server.close(() => process.exit(0)));
+    `);
+
+    const handler = vi.fn(async () => ({ operation: "close" as const }));
+    const daemon = await startDaemon({
+      daemonEntry: entry,
+      dataDirectory: directory,
+      token: "test-token",
+      allowedOrigins: ["null"],
+      executable: process.execPath,
+      environment: {},
+      healthTimeoutMs: 2_000,
+      handlePlaytestRequest: handler,
+    });
+
+    await vi.waitFor(async () => {
+      expect(JSON.parse(await readFile(resultFile, "utf8"))).toMatchObject({
+        channel: "ohmygame:playtest-response",
+        id: "request-1",
+        result: { operation: "close" },
+      });
+    });
+    expect(handler).toHaveBeenCalledWith(
+      { operation: "close", sessionId: "session-1" },
+      expect.any(AbortSignal),
+    );
+    await daemon.stop();
+  });
+});
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}

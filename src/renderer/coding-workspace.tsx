@@ -1,0 +1,1586 @@
+import { previewPageUrl as isolatedPreviewUrl } from "../shared/preview-page.js";
+import {
+  ArrowLeft,
+  Check,
+  Copy,
+  ChevronDown,
+  ChevronRight,
+  Code2,
+  ExternalLink,
+  FileCode2,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  Globe2,
+  Image as ImageIcon,
+  LaptopMinimalistic,
+  Layers3,
+  LoaderCircle,
+  Monitor,
+  PanelToggle,
+  Pencil,
+  Plus,
+  Play,
+  RefreshCw,
+  Search,
+  Share2,
+  Smartphone,
+  Tablet,
+  Trash2,
+  Video,
+  Wrench,
+  X,
+  type IconComponent,
+} from "./icons.js";
+import { lazy, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Tree, type NodeRendererProps, type TreeApi } from "react-arborist";
+import type { PreviewViewport, ProjectFileOpenMode, ProjectState, WorkspaceFile, WorkspaceFileContent } from "../shared/contracts.js";
+import type { PlaytestWatchState } from "../shared/playtest.js";
+import { isWebRuntimeProjectType, supportsWebPreview } from "../shared/project-runtime.js";
+import { createWorkspaceEntry, deleteWorkspaceEntry, getProjectCover, getProjectCoverState, getWorkspaceFile, listWorkspaceFiles, renameWorkspaceEntry, saveProjectAssetToLibrary, setProjectCover } from "./api.js";
+import { captureElementImage } from "./page-capture.js";
+import { AssetToolbar, WorkspaceAssetCard, WorkspaceAssetDialog, fileName, filterAssets, hasMediaType, type MediaFilter, type ProjectAssetFilters } from "./asset-browser.js";
+import { ProjectAssetCollectionFilters } from "./library-filters.js";
+import { ProjectRenameDialog } from "./project-rename-dialog.js";
+import { HighlightedCode } from "./highlighted-code.js";
+import { PublishDialog, type PublishDetails } from "./publish-dialog.js";
+import { ProjectSettingsDialog } from "./project-settings-dialog.js";
+import { AssetMedia } from "./asset-gallery.js";
+import { useWorkspaceAssetUrl } from "./use-workspace-asset-url.js";
+import { WorkspaceTabs, type WorkspaceTabOption } from "./workspace-tabs.js";
+import { useWebGamePlayer } from "./use-web-game-player.js";
+import { ErrorBoundary } from "./error-boundary.js";
+import { useRuntimeConnection } from "./runtime-connection.js";
+import { DesktopGamePreview } from "./desktop-game-preview.js";
+import { t } from "./i18n.js";
+import { GitChangesList, useWorkspaceGitChanges, WorkspaceGitDiff } from "./workspace-git-changes.js";
+import { WorkspaceBackButton } from "./workspace-shell.js";
+
+type WorkspaceTab = "preview" | "code" | "assets";
+const CanvasWorkspace = lazy(() => import("./canvas-workspace.js").then((module) => ({ default: module.CanvasWorkspace })));
+type WorkspaceContextMenu = { path: string; directory: boolean; x: number; y: number };
+type WorkspaceFileChange = { from?: string; to?: string };
+type WorkspaceEntryAction = "new-file" | "new-folder" | "rename" | "delete" | "copy-path" | "save-library";
+
+export function workspacePathAfterChange(selectedPath: string | undefined, change: WorkspaceFileChange): string | undefined {
+  if (!change.from) return change.to ?? selectedPath;
+  if (!selectedPath || (selectedPath !== change.from && !selectedPath.startsWith(`${change.from}/`))) return selectedPath;
+  return change.to ? `${change.to}${selectedPath.slice(change.from.length)}` : undefined;
+}
+interface CodingWorkspaceProps {
+  project?: ProjectState;
+  agentBusy: boolean;
+  publishing: boolean;
+  workspaceRevision: number;
+  previewPaused?: boolean;
+  onPublish: (details: PublishDetails) => Promise<boolean>;
+  publishDialog?: "open" | "success";
+  onOpenPublish: () => void;
+  onClosePublish: () => void;
+  onRestart: (project?: ProjectState, reinstall?: boolean) => void;
+  onStop?: () => Promise<void>;
+  onAskAgent?: (text: string) => void;
+  designOpen?: boolean;
+  onDesignOpenChange?: (open: boolean) => void;
+  onDesignSaveReady?: (save: (() => Promise<void>) | undefined) => void;
+  onDesignContextChange?: (context: import("../shared/contracts.js").PromptContext | undefined) => void;
+  onProjectUpdated?: (project: ProjectState) => void;
+  onClose?: () => void;
+  openFileRequest?: { path: string; id: number };
+  chatOnRight?: boolean;
+  chatCollapsed?: boolean;
+  onHome?: () => void;
+  homeLabel?: string;
+  onToggleChat?: () => void;
+}
+
+export function CodingWorkspace({
+  project,
+  agentBusy,
+  publishing,
+  workspaceRevision,
+  previewPaused = false,
+  onPublish,
+  publishDialog,
+  onOpenPublish,
+  onClosePublish,
+  onRestart,
+  onStop,
+  onAskAgent,
+  designOpen = false,
+  onDesignOpenChange,
+  onDesignSaveReady,
+  onDesignContextChange,
+  onProjectUpdated,
+  onClose,
+  openFileRequest,
+  chatOnRight = false,
+  chatCollapsed = false,
+  onHome,
+  homeLabel = t("navigation.backTo", { page: t("sidebar.projects") }),
+  onToggleChat,
+}: CodingWorkspaceProps) {
+  const supportsPreview = supportsWebPreview(project);
+  const publishingUnavailable = project?.type === "godot-game";
+  const publishLabel = project?.type === "godot-game"
+    ? t("workspace.godotPublishing")
+    : publishing ? t("workspace.publishing") : t("workspace.publish");
+  const [selectedTab, setSelectedTab] = useState<WorkspaceTab>(supportsPreview ? "preview" : "code");
+  const activeTab = selectedTab === "preview" && !supportsPreview ? "code" : selectedTab;
+  const supportsParallelCanvas = project?.type === "godot-game" && supportsPreview && !!onDesignOpenChange;
+  const parallelCanvas = supportsParallelCanvas && (designOpen || activeTab === "preview");
+  const shownTab = parallelCanvas ? "preview" : designOpen ? "design" : activeTab;
+  const [designHeaderActions, setDesignHeaderActions] = useState<HTMLDivElement | null>(null);
+  const designLeave = useRef<((action: () => void) => void) | undefined>(undefined);
+  const registerDesignLeave = useCallback((leave: ((action: () => void) => void) | undefined) => { designLeave.current = leave; }, []);
+  const [viewport, setViewport] = useState<PreviewViewport>(project?.previewViewport ?? "fit");
+  const [previewPath, setPreviewPath] = useState(project?.previewPath ?? "/");
+  const [previewClient] = useState(() => crypto.randomUUID());
+  const [actualPreviewPath, setActualPreviewPath] = useState(project?.previewPath ?? "/");
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [knownPaths, setKnownPaths] = useState<string[]>(["/"]);
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [selectedCodePath, setSelectedCodePath] = useState<string>();
+  const [selectedFile, setSelectedFile] = useState<WorkspaceFileContent>();
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string>();
+  const [filesRevision, setFilesRevision] = useState(0);
+  const [reload, setReload] = useState(0);
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+  const [agentPlaytestWatch, setAgentPlaytestWatch] = useState<PlaytestWatchState | undefined>(() => (
+    typeof window !== "undefined" && window.ohMyGameDesktop?.agentPlaytests ? { visible: false, activeSessions: 0 } : undefined
+  ));
+  const [agentPlaytestWatchPending, setAgentPlaytestWatchPending] = useState(false);
+  const fileRequest = useRef(0);
+  const preview = project?.preview;
+  const previewBaseUrl = preview?.status === "ready" ? preview.url : undefined;
+  const player = useWebGamePlayer(supportsPreview ? project?.id : undefined, previewBaseUrl, preview?.revision, preview?.pages?.find((page) => page.source === "player")?.path);
+  const nativePreview = typeof window !== "undefined" && window.ohMyGameDesktop?.webGamePlayer?.preview;
+  const gameClient = nativePreview ? player.client ?? previewClient : previewClient;
+  const previewPageUrl = previewBaseUrl ? isolatedPreviewUrl(new URL(previewPath, previewBaseUrl).toString(), "editor", gameClient) : undefined;
+  const currentPreviewUrl = previewBaseUrl ? isolatedPreviewUrl(new URL(actualPreviewPath, previewBaseUrl).toString(), "editor", gameClient) : undefined;
+  const previewStage = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const page = preview?.pages?.find((page) => nativePreview ? page.client === gameClient : player.open ? page.source === "player" : page.client === previewClient);
+    if (!page) return;
+    setActualPreviewPath(page.path);
+    setKnownPaths((current) => current.includes(page.path) ? current : [...current, page.path]);
+  }, [preview?.pages, gameClient, previewClient, player.open, nativePreview]);
+
+  useEffect(() => {
+    setPreviewPath(project?.previewPath ?? "/");
+    setActualPreviewPath(project?.previewPath ?? "/");
+  }, [project?.id, project?.previewPath]);
+
+  useEffect(() => {
+    if (preview?.status !== "ready") setPreviewPath(actualPreviewPath);
+  }, [preview?.status]);
+  const previousPlayerOpen = useRef(false);
+  useEffect(() => {
+    if (!nativePreview && previousPlayerOpen.current && !player.open) {
+      const page = preview?.pages?.find((page) => page.source === "player");
+      if (page) { setPreviewPath(page.path); setActualPreviewPath(page.path); }
+    }
+    previousPlayerOpen.current = player.open;
+  }, [player.open]);
+
+  useEffect(() => {
+    setViewport(project?.previewViewport ?? "fit");
+  }, [project?.id, project?.previewViewport]);
+
+  useEffect(() => {
+    setKnownPaths(["/"]);
+  }, [project?.id]);
+
+  useEffect(() => {
+    const watch = window.ohMyGameDesktop?.agentPlaytests;
+    if (!watch) return;
+    let disposed = false;
+    const unsubscribe = watch.onState((state) => { if (!disposed) setAgentPlaytestWatch(state); });
+    void watch.state().then((state) => { if (!disposed) setAgentPlaytestWatch(state); }).catch(() => undefined);
+    return () => { disposed = true; unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    fileRequest.current += 1;
+    setFiles([]);
+    setSelectedCodePath(undefined);
+    setSelectedFile(undefined);
+    setFilesError(undefined);
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (!project || designOpen || activeTab === "preview") return;
+    let disposed = false;
+    const request = ++fileRequest.current;
+    setFilesLoading(true);
+    setFilesError(undefined);
+    void listWorkspaceFiles(project.id).then(async (result) => {
+      if (disposed) return;
+      setFiles(result);
+      if (fileRequest.current === request && activeTab === "code" && selectedCodePath) {
+        const selected = result.find((file) => file.path === selectedCodePath);
+        if (selected) {
+          const content = await loadWorkspaceFile(project.id, selectedCodePath, result);
+          if (!disposed && fileRequest.current === request) setSelectedFile(content);
+        } else {
+          setSelectedCodePath(undefined);
+          setSelectedFile(undefined);
+        }
+      }
+    }).catch((cause) => {
+      if (!disposed && fileRequest.current === request) setFilesError(errorMessage(cause));
+    }).finally(() => {
+      if (!disposed && fileRequest.current === request) setFilesLoading(false);
+    });
+    return () => { disposed = true; };
+  }, [project?.id, activeTab, designOpen, workspaceRevision, filesRevision]);
+
+  async function selectFile(filePath: string): Promise<void> {
+    if (!project) return;
+    const request = ++fileRequest.current;
+    setSelectedCodePath(filePath);
+    setSelectedFile(undefined);
+    setFilesLoading(true);
+    setFilesError(undefined);
+    try {
+      const content = await loadWorkspaceFile(project.id, filePath, files);
+      if (fileRequest.current === request) setSelectedFile(content);
+    } catch (cause) {
+      if (fileRequest.current === request) setFilesError(errorMessage(cause));
+    } finally {
+      if (fileRequest.current === request) setFilesLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!openFileRequest) return;
+    if (activeTab === "code") {
+      void selectFile(openFileRequest.path);
+    } else {
+      setSelectedCodePath(openFileRequest.path);
+      setSelectedTab("code");
+    }
+  }, [openFileRequest?.id]);
+
+  function navigatePreview(path: string): void {
+    if (!previewBaseUrl) return;
+    const nextPath = normalizePreviewPath(path);
+    setPreviewPath(nextPath);
+    setActualPreviewPath(nextPath);
+    setKnownPaths((current) => current.includes(nextPath) ? current : [...current, nextPath]);
+  }
+
+  function refreshPreview(): void {
+    if (preview?.status === "ready") {
+      if (player.open) void player.reload();
+      else if (nativePreview) setReload((value) => value + 1);
+      else { setPreviewPath(actualPreviewPath); setReload((value) => value + 1); }
+    } else if (preview?.status === "error" || preview?.status === "stopped") {
+      onRestart();
+    }
+  }
+
+  function playGame(): void {
+    const bounds = previewStage.current?.getBoundingClientRect();
+    void player.play({ path: actualPreviewPath, viewport: playerViewport(viewport, bounds) });
+  }
+
+  async function toggleAgentPlaytestWatch(): Promise<void> {
+    const watch = window.ohMyGameDesktop?.agentPlaytests;
+    if (!watch || agentPlaytestWatchPending) return;
+    setAgentPlaytestWatchPending(true);
+    try { setAgentPlaytestWatch(await watch.setVisible(!agentPlaytestWatch?.visible)); }
+    catch { try { setAgentPlaytestWatch(await watch.state()); } catch {} }
+    finally { setAgentPlaytestWatchPending(false); }
+  }
+
+  const tabs: WorkspaceTabOption<WorkspaceTab | "design">[] = [
+    ...(supportsPreview ? [{ id: "preview" as const, label: t(supportsParallelCanvas ? "workspace.canvasAndPreview" : "workspace.tab.preview"), icon: Globe2 }] : []),
+    ...(onDesignOpenChange && !supportsParallelCanvas ? [{ id: "design" as const, label: t("workspace.tab.design"), icon: FileText }] : []),
+    { id: "code", label: t("workspace.tab.code"), icon: Code2 },
+    { id: "assets", label: t("workspace.tab.assets"), icon: Layers3 },
+  ];
+  const renderNavigation = () => <div className={`viewer-navigation${chatOnRight ? " is-chat-right" : ""}`}>
+    {chatOnRight && onHome ? (
+      <WorkspaceBackButton onClick={onHome} label={homeLabel} icon={ArrowLeft} />
+    ) : null}
+    <WorkspaceTabs tabs={tabs} active={shownTab} onChange={(tab) => {
+      const navigate = () => {
+        if (tab !== "design") setSelectedTab(tab);
+        onDesignOpenChange?.(tab === "design");
+      };
+      if ((designOpen || parallelCanvas) && designLeave.current) designLeave.current(navigate);
+      else navigate();
+    }} />
+  </div>;
+
+  return (
+    <section className="viewer-pane coding-workspace" data-active-tab={shownTab} aria-label={t("workspace.label")}>
+      <header className="pane-header viewer-header window-drag-handle">
+        <span className="workspace-navigation-drag-exclusion" aria-hidden="true" />
+        {renderNavigation()}
+        <div className="viewer-controls-slot">
+          {supportsPreview && shownTab === "preview" ? (
+            <PreviewControls
+              path={actualPreviewPath}
+              paths={knownPaths}
+              previewUrl={currentPreviewUrl}
+              refreshDisabled={!project || preview?.status === "waiting" || preview?.status === "starting"}
+              refreshLabel={preview?.status === "ready" ? t("workspace.reloadPreview") : t("workspace.restartPreview")}
+              viewport={viewport}
+              agentPlaytestWatch={agentPlaytestWatch}
+              agentPlaytestWatchPending={agentPlaytestWatchPending}
+              onOpenSettings={() => setProjectSettingsOpen(true)}
+              onNavigate={navigatePreview}
+              onRefresh={refreshPreview}
+              onToggleAgentPlaytestWatch={() => void toggleAgentPlaytestWatch()}
+              onViewportChange={setViewport}
+            />
+          ) : null}
+        </div>
+        <div className={`viewer-publish${designOpen && !parallelCanvas ? " design-header-actions" : ""}`} ref={parallelCanvas ? undefined : setDesignHeaderActions}>
+          {project && (isWebRuntimeProjectType(project.type) || project.type === "godot-game") && shownTab !== "preview" ? <button
+            className="icon-button pane-header-action"
+            type="button"
+            aria-label={t("projectSettings.title")}
+            data-tooltip={t("projectSettings.title")}
+            onClick={() => setProjectSettingsOpen(true)}
+          ><Wrench size={14} /></button> : null}
+          {!designOpen || parallelCanvas ? <>
+          {supportsPreview ? <button
+            className={`icon-button pane-header-action preview-play-button${player.open ? " is-active" : ""}`}
+            type="button"
+            aria-label={player.open ? t("workspace.returnToGame") : t("workspace.play")}
+            data-tooltip={player.pending ? t("workspace.openingGame") : player.open ? t("workspace.returnToGame") : t("workspace.playInWindow")}
+            disabled={player.pending || (player.checking && !player.error) || (!player.open && (!project || preview?.status === "waiting" || preview?.status === "starting"))}
+            onClick={playGame}
+          >{player.pending ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}</button> : null}
+          <button
+            className="publish-button workspace-publish-button"
+            type="button"
+            onClick={onOpenPublish}
+            disabled={!project || publishingUnavailable || publishing || agentBusy}
+            title={publishLabel}
+            aria-label={publishLabel}
+          >
+            {publishing ? <LoaderCircle className="spin" size={14} /> : <Share2 size={14} />}
+            <span>{t("workspace.publish")}</span>
+          </button>
+          {onClose ? (
+            <button
+              className="icon-button pane-header-action"
+              type="button"
+              onClick={onClose}
+              title={t("workspace.hideWorkspace")}
+              aria-label={t("workspace.hideWorkspace")}
+            >
+              <PanelToggle size={14} />
+            </button>
+          ) : null}
+          {chatOnRight && chatCollapsed && onToggleChat ? (
+            <button
+              className="icon-button pane-header-action"
+              type="button"
+              onClick={onToggleChat}
+              title={t("workspace.showChat")}
+              aria-label={t("workspace.showChat")}
+            >
+              <PanelToggle size={14} />
+            </button>
+          ) : null}</> : null}
+        </div>
+      </header>
+
+      <div className={parallelCanvas ? "coding-workspace-studio-split" : "coding-workspace-surfaces"}>
+      {parallelCanvas ? <section className="coding-workspace-canvas-panel" aria-label={t("canvas.designWorkspace")}>
+        <header className="studio-surface-header"><span>{t("canvas.tab.canvas")}</span><div className="design-header-actions" ref={setDesignHeaderActions} /></header>
+        <Suspense fallback={<div className="design-loading"><LoaderCircle className="spin" size={18} /></div>}><CanvasWorkspace
+          project={project!} workspaceRevision={workspaceRevision} onProjectUpdated={onProjectUpdated} headerActionsTarget={designHeaderActions} onLeaveReady={registerDesignLeave} onSaveReady={onDesignSaveReady} onContextChange={onDesignContextChange}
+        /></Suspense>
+      </section> : null}
+      {designOpen && !parallelCanvas && project ? <Suspense fallback={<div className="design-loading"><LoaderCircle className="spin" size={18} /></div>}><CanvasWorkspace
+        project={project} onProjectUpdated={onProjectUpdated} headerActionsTarget={designHeaderActions} onLeaveReady={registerDesignLeave} onSaveReady={onDesignSaveReady} onContextChange={onDesignContextChange}
+      /></Suspense> : null}
+
+      {supportsPreview ? (
+        <div
+          className="coding-workspace-preview-panel"
+          hidden={shownTab !== "preview"}
+          aria-hidden={shownTab !== "preview"}
+        >
+          <ErrorBoundary label={t("errorBoundary.label.preview")} resetKey={previewPageUrl}>
+          <PreviewView
+            project={project} client={gameClient} onAskAgent={onAskAgent} onLogs={() => setLogsOpen(true)} onOpenFile={(path) => { setSelectedCodePath(path); setSelectedTab("code"); void selectFile(path); }} reload={reload} revision={workspaceRevision} url={previewPageUrl} viewport={viewport}
+            pausedAfterRecovery={previewPaused}
+            active={shownTab === "preview"} playerOpen={player.open} suspended={player.suspended} pending={player.pending || player.checking}
+            error={player.error} onPlay={playGame} stageRef={previewStage}
+            onRetry={() => onRestart()} onSettings={() => setProjectSettingsOpen(true)}
+          />
+          </ErrorBoundary>
+        </div>
+      ) : null}
+      </div>
+      {shownTab === "code" ? (
+        <WorkspaceFileBrowser
+          files={files}
+          selectedPath={selectedCodePath}
+          selectedFile={selectedFile}
+          loading={filesLoading}
+          error={filesError}
+          onSelect={selectFile}
+          projectId={project?.id}
+          revision={workspaceRevision}
+          filesRevision={filesRevision}
+          openFileRequestId={openFileRequest?.id}
+          onFilesChanged={(change) => {
+            fileRequest.current += 1;
+            setSelectedCodePath((current) => workspacePathAfterChange(current, change));
+            setSelectedFile(undefined);
+            setFilesRevision((value) => value + 1);
+          }}
+          onOpenExternal={project && typeof window !== "undefined" && window.ohMyGameDesktop?.openProjectFile
+            ? (path, mode) => window.ohMyGameDesktop!.openProjectFile(project.id, path, mode)
+            : undefined}
+        />
+      ) : shownTab === "assets" ? (
+        <AssetsView
+          key={project?.id}
+          projectId={project?.id}
+          files={files.filter((file) => file.mediaType && !file.directory)}
+          loading={filesLoading}
+          error={filesError}
+          revision={workspaceRevision + filesRevision}
+          onShowInCode={(path) => {
+            setSelectedCodePath(path);
+            setSelectedTab("code");
+          }}
+        />
+      ) : null}
+      {supportsPreview && logsOpen ? <PreviewLogs project={project} onClose={() => setLogsOpen(false)} /> : null}
+      {project && publishDialog ? <PublishDialog project={project} publishing={publishing} justPublished={publishDialog === "success"} onClose={onClosePublish} onPublish={onPublish} /> : null}
+      {project && projectSettingsOpen ? <ProjectSettingsDialog
+        project={project}
+        previewUrl={currentPreviewUrl}
+        previewActions={supportsPreview ? {
+          onRestart: (reinstall) => onRestart(undefined, reinstall),
+          onStop: onStop ? () => { void player.close().catch(() => {}).then(onStop); } : undefined,
+          onLogs: () => { setProjectSettingsOpen(false); setLogsOpen(true); },
+        } : undefined}
+        onClose={() => setProjectSettingsOpen(false)}
+        onSaved={(updated) => onProjectUpdated?.(updated)}
+      /> : null}
+    </section>
+  );
+}
+
+function PreviewControls({
+  path,
+  paths,
+  previewUrl,
+  refreshDisabled,
+  refreshLabel,
+  viewport,
+  agentPlaytestWatch,
+  agentPlaytestWatchPending,
+  onOpenSettings,
+  onNavigate,
+  onRefresh,
+  onToggleAgentPlaytestWatch,
+  onViewportChange,
+}: {
+  path: string;
+  paths: string[];
+  previewUrl?: string;
+  refreshDisabled: boolean;
+  refreshLabel: string;
+  viewport: PreviewViewport;
+  agentPlaytestWatch?: PlaytestWatchState;
+  agentPlaytestWatchPending: boolean;
+  onOpenSettings: () => void;
+  onNavigate: (path: string) => void;
+  onRefresh: () => void;
+  onToggleAgentPlaytestWatch: () => void;
+  onViewportChange: (viewport: PreviewViewport) => void;
+}) {
+  return (
+    <div className="preview-controls">
+      <ViewportMenu value={viewport} onChange={onViewportChange} />
+      <PreviewLocation
+        disabled={!previewUrl}
+        path={path}
+        paths={paths}
+        refreshDisabled={refreshDisabled}
+        refreshLabel={refreshLabel}
+        onNavigate={onNavigate}
+        onRefresh={onRefresh}
+      />
+      {agentPlaytestWatch ? (
+        <button className={`icon-button pane-header-action preview-agent-watch-button${agentPlaytestWatch.visible ? " is-active" : ""}`} type="button" aria-label={agentPlaytestWatch.visible ? t("workspace.hidePlaytest") : t("workspace.showPlaytest")} aria-pressed={agentPlaytestWatch.visible} disabled={agentPlaytestWatchPending} data-tooltip={agentPlaytestWatch.visible ? t("workspace.hidePlaytest") : t("workspace.showPlaytest")} onClick={onToggleAgentPlaytestWatch}>
+          <Video size={15} />
+        </button>
+      ) : null}
+      <button
+        className="icon-button quiet-button preview-settings-button"
+        type="button"
+        onClick={onOpenSettings}
+        title={t("projectSettings.title")}
+        aria-label={t("projectSettings.title")}
+      >
+        <Wrench size={15} />
+      </button>
+    </div>
+  );
+}
+
+function PreviewLocation({
+  disabled,
+  path,
+  paths,
+  refreshDisabled,
+  refreshLabel,
+  onNavigate,
+  onRefresh,
+}: {
+  disabled: boolean;
+  path: string;
+  paths: string[];
+  refreshDisabled: boolean;
+  refreshLabel: string;
+  onNavigate: (path: string) => void;
+  onRefresh: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const search = useRef<HTMLInputElement>(null);
+  const popoverId = useId();
+  const normalizedQuery = query.trim() ? normalizePreviewPath(query) : undefined;
+  const matchingPaths = paths.filter((knownPath) => knownPath.toLowerCase().includes(query.trim().toLowerCase()));
+  const options = normalizedQuery && !matchingPaths.includes(normalizedQuery)
+    ? [...matchingPaths, normalizedQuery]
+    : matchingPaths;
+
+  useEffect(() => {
+    if (!open) return;
+    search.current?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  function navigate(nextPath: string): void {
+    onNavigate(nextPath);
+    setOpen(false);
+    setQuery("");
+    trigger.current?.focus();
+  }
+
+  return (
+    <div className="preview-location" ref={root}>
+      <button
+        className="preview-location-refresh"
+        type="button"
+        onClick={onRefresh}
+        disabled={refreshDisabled}
+        title={refreshLabel}
+        aria-label={refreshLabel}
+      >
+        <RefreshCw size={15} />
+      </button>
+      <button
+        ref={trigger}
+        className="preview-location-trigger"
+        type="button"
+        aria-controls={popoverId}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        disabled={disabled}
+        onClick={() => {
+          setQuery("");
+          setOpen((current) => !current);
+        }}
+        title={path}
+      >
+        <span className="preview-location-path">{path}</span>
+        <ChevronDown className={open ? "preview-location-chevron-open" : undefined} size={13} />
+      </button>
+      {open ? (
+        <div className="preview-location-popover" id={popoverId} role="dialog" aria-label={t("workspace.previewPages")}>
+          <form
+            className="preview-location-search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (normalizedQuery) navigate(normalizedQuery);
+            }}
+          >
+            <Search size={16} />
+            <input
+              ref={search}
+              aria-label={t("workspace.findPage")}
+              placeholder={t("workspace.findPage")}
+              spellCheck={false}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || !normalizedQuery) return;
+                event.preventDefault();
+                navigate(normalizedQuery);
+              }}
+            />
+          </form>
+          <div className="preview-location-options">
+            {options.map((option) => (
+              <button
+                className="preview-location-option"
+                type="button"
+                aria-current={option === path ? "page" : undefined}
+                key={option}
+                onClick={() => navigate(option)}
+              >
+                <span>{option === path ? <Check size={14} /> : null}</span>
+                <strong>{option}</strong>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ViewportMenu({ value, onChange }: { value: PreviewViewport; onChange: (value: PreviewViewport) => void }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      trigger.current?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="viewport-menu" ref={root}>
+      <button
+        ref={trigger}
+        className="viewport-trigger"
+        type="button"
+        aria-controls={menuId}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={t("workspace.viewportLabel")}
+        title={viewportLabel(value)}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ViewportIcon viewport={value} />
+        <ChevronDown size={11} />
+      </button>
+      {open ? (
+        <div className="viewport-menu-popover" id={menuId} role="menu" aria-label={t("workspace.viewportLabel")}>
+          {(["fit", "tablet", "mobile"] as const).map((viewport) => (
+            <button
+              className="viewport-option"
+              type="button"
+              role="menuitemradio"
+              aria-checked={viewport === value}
+              key={viewport}
+              onClick={() => {
+                onChange(viewport);
+                setOpen(false);
+                trigger.current?.focus();
+              }}
+            >
+              <ViewportIcon viewport={viewport} />
+              <span>{viewportLabel(viewport)}</span>
+              {viewport === value ? <Check size={13} /> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ViewportIcon({ viewport }: { viewport: PreviewViewport }) {
+  if (viewport === "tablet") return <Tablet size={14} />;
+  if (viewport === "mobile") return <Smartphone size={14} />;
+  return <Monitor size={14} />;
+}
+
+function viewportLabel(viewport: PreviewViewport): string {
+  if (viewport === "tablet") return t("workspace.viewport.tablet");
+  if (viewport === "mobile") return t("workspace.viewport.mobile");
+  return t("projectSettings.device.fit");
+}
+
+export function playerViewport(viewport: PreviewViewport, bounds?: { width: number; height: number }): { width: number; height: number } {
+  if (viewport === "mobile") return { width: 375, height: 667 };
+  if (viewport === "tablet") return { width: 768, height: 1024 };
+  const size = (value: number | undefined, fallback: number) => Math.min(8192, Math.max(240, Math.round(value || fallback)));
+  return { width: size(bounds?.width, 1280), height: size(bounds?.height, 720) };
+}
+
+export function PreviewView({ project, client, onAskAgent, onOpenFile, onLogs, reload, revision, url, viewport, active = true, playerOpen = false, suspended = false, pending = false, pausedAfterRecovery = false, error, onPlay, onRetry, onSettings, stageRef }: {
+  client?: string; onAskAgent?: (text: string) => void; onOpenFile?: (path: string) => void; onLogs?: () => void;
+  project?: ProjectState; reload: number; revision: number; url?: string; viewport: PreviewViewport;
+  active?: boolean; playerOpen?: boolean; suspended?: boolean; pending?: boolean; error?: string; onPlay?: () => void;
+  pausedAfterRecovery?: boolean;
+  stageRef?: React.Ref<HTMLDivElement>;
+  onRetry?: () => void; onSettings?: () => void;
+}) {
+  const runtime = useRuntimeConnection();
+  const preview = project?.preview;
+  const frame = useRef<HTMLElement | null>(null);
+  const native = typeof window !== "undefined" ? window.ohMyGameDesktop?.webGamePlayer?.preview : undefined;
+  const captureTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [started, setStarted] = useState(active && !suspended);
+  const [cover, setCover] = useState<string>();
+  const diagnostic = preview?.diagnostics?.length
+    ? preview.diagnostics.find((item) => native ? item.client === client : playerOpen ? item.source === "player" : item.client === client)
+    : preview?.diagnostic;
+  const captureBlocked = useRef(false);
+  captureBlocked.current = !!diagnostic || runtime.status !== "ready";
+
+  useEffect(() => {
+    if (diagnostic || runtime.status !== "ready") clearTimeout(captureTimer.current);
+  }, [diagnostic, runtime.status]);
+
+  useEffect(() => {
+    if (suspended) { if (!native) setStarted(false); clearTimeout(captureTimer.current); }
+    else if (active) setStarted(true);
+  }, [suspended, active]);
+
+  useEffect(() => {
+    setCover(undefined);
+    if (!project || !playerOpen) return;
+    let disposed = false;
+    let objectUrl: string | undefined;
+    void getProjectCover(project.id).then((blob) => {
+      if (disposed || !blob) return;
+      objectUrl = URL.createObjectURL(blob);
+      setCover(objectUrl);
+    }).catch(() => {});
+    return () => { disposed = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [project?.id, playerOpen]);
+
+  useEffect(() => () => clearTimeout(captureTimer.current), []);
+  useEffect(() => {
+    if (revision > 0 && frame.current) scheduleCoverCapture(frame.current);
+  }, [revision]);
+
+  function scheduleCoverCapture(element: HTMLElement): void {
+    frame.current = element;
+    clearTimeout(captureTimer.current);
+    if (!project || !window.ohMyGameDesktop?.capturePage) return;
+    captureTimer.current = setTimeout(() => {
+      if (captureBlocked.current) return;
+      void captureProjectCover(project.id, element, native ? () => native.capture(project.id) : undefined).catch(() => {});
+    }, 1_000);
+  }
+
+  const showFrame = (active || started || (native && playerOpen)) && (native || !suspended) && preview?.status === "ready" && url;
+  return (
+    <div ref={stageRef} className={`viewer-stage viewer-stage-${viewport}`}>
+      {showFrame ? <div className="preview-frame-wrap" hidden={suspended}>
+        {native && project ? <DesktopGamePreview
+          bridge={native} refresh={window.ohMyGameDesktop!.webGamePlayer!.refresh} projectId={project.id} url={url!} reload={reload}
+          visible={active && !suspended && !diagnostic && !error && runtime.status === "ready"}
+          onReady={scheduleCoverCapture}
+        /> : <iframe
+          ref={(element) => { frame.current = element; }}
+          key={`${url}:${reload}`} className="preview-frame" src={url}
+          title={t("workspace.previewTitle", { name: project?.name ?? t("workspace.project") })}
+          sandbox="allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts"
+          onLoad={(event) => scheduleCoverCapture(event.currentTarget)}
+        />}
+      </div> : null}
+      {suspended ? <div className="preview-player-state">
+        {cover ? <img className="preview-player-cover" src={cover} alt="" /> : null}
+        <div className="preview-empty-state">
+          <div className="preview-empty-mark" aria-hidden="true">{pending ? <LoaderCircle className="spin" size={20} /> : <Play size={20} />}</div>
+          <p className="preview-empty-title">{pending ? t("workspace.openingGame") : t("workspace.gameInWindow")}</p>
+          <p className="preview-empty-description">{t("workspace.closeWindowHint")}</p>
+          {playerOpen && onPlay ? <button type="button" className="preview-return-button" disabled={pending} onClick={onPlay}>{t("workspace.returnToGame")}</button> : null}
+        </div>
+      </div> : !showFrame ? <div className="preview-status-panel">
+        <PreviewState status={preview?.status} error={preview?.error} phase={preview?.phase} startedAt={preview?.startedAt} />
+        {(pausedAfterRecovery || preview?.stopReason === "recovery") && preview?.status === "stopped" ? <p>{t("workspace.pausedAfterRecovery")}</p> : null}
+        {preview?.status === "stopped" && preview.stopReason === "manual" ? <p>{t("workspace.stoppedManual")}</p> : preview?.status === "stopped" && preview.stopReason === "idle" ? <p>{t("workspace.stoppedIdle")}</p> : preview?.status === "stopped" && project?.previewAutoStart === false ? <p>{t("workspace.autoDisabled")}</p> : null}
+        {onRetry && (preview?.status === "error" || preview?.status === "stopped") ? <div className="preview-recovery-actions">
+          <button type="button" disabled={runtime.status !== "ready"} onClick={onRetry}>{preview.status === "stopped" ? t("projectSettings.startPreview") : t("workspace.retryPreview")}</button>
+          {onSettings ? <button type="button" onClick={onSettings}>{t("projectSettings.title")}</button> : null}
+          {onLogs ? <button type="button" onClick={onLogs}>{t("workspace.viewLogs")}</button> : null}
+          {preview?.error && onAskAgent ? <button type="button" onClick={() => onAskAgent(previewRepairPrompt(project, preview.error!))}>{t("workspace.askAgent")}</button> : null}
+        </div> : null}
+      </div> : null}
+      {diagnostic ? <div className="preview-diagnostic" role="alert">
+        <strong>{diagnostic.kind === "compile" ? t("workspace.compileFailed") : diagnostic.kind === "runtime" ? t("workspace.runtimeError") : t("workspace.loadFailed")}</strong>
+        <details><summary>{t("common.errorDetails")}</summary><pre>{diagnostic.message}</pre></details>
+        <p>{diagnostic.source === "playtest" ? t("workspace.source.playtest") : diagnostic.source === "player" ? t("workspace.source.player") : t("workspace.previewSource")}{diagnostic.path ? ` · ${diagnostic.path}` : ""}</p>
+        <div className="preview-recovery-actions">
+          <button type="button" onClick={() => void navigator.clipboard.writeText(diagnostic.message)}>{t("workspace.copyError")}</button>
+          {onLogs ? <button type="button" onClick={onLogs}>{t("workspace.viewLogs")}</button> : null}
+          {onAskAgent ? <button type="button" onClick={() => onAskAgent(previewRepairPrompt(project, diagnostic.message))}>{t("workspace.askAgent")}</button> : null}
+          {onOpenFile && previewErrorFile(project, diagnostic.message) ? <button type="button" onClick={() => onOpenFile(previewErrorFile(project, diagnostic.message)!)}>{t("workspace.openSource")}</button> : null}
+        </div>
+      </div> : null}
+      {error ? <div className="preview-player-error" role="alert">{error}</div> : null}
+    </div>
+  );
+}
+
+async function captureProjectCover(projectId: string, frame: HTMLElement, capture?: () => Promise<Uint8Array>): Promise<void> {
+  if ((await getProjectCoverState(projectId)).mode === "custom") return;
+  // A publish dialog can cover the preview in the desktop window's screenshot.
+  if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+  const cover = await captureElementImage(frame, 800, undefined, capture);
+  if (cover) await setProjectCover(projectId, cover, "auto");
+}
+
+export function normalizePreviewPath(value: string): string {
+  const path = value.trim().replaceAll("\\", "/").replace(/^\/+/, "");
+  return path ? `/${path}` : "/";
+}
+
+export function WorkspaceFileBrowser({
+  files,
+  selectedPath,
+  selectedFile,
+  loading,
+  error,
+  onSelect,
+  onOpenExternal,
+  projectId,
+  revision = 0,
+  filesRevision = 0,
+  openFileRequestId,
+  onFilesChanged = () => {},
+  fileActions,
+  renderFile,
+}: {
+  files: WorkspaceFile[];
+  selectedPath?: string;
+  selectedFile?: WorkspaceFileContent;
+  loading: boolean;
+  error?: string;
+  onSelect: (path: string) => void;
+  onOpenExternal?: (path: string, mode: ProjectFileOpenMode) => Promise<void>;
+  projectId?: string;
+  revision?: number;
+  filesRevision?: number;
+  openFileRequestId?: number;
+  onFilesChanged?: (change: WorkspaceFileChange) => void;
+  fileActions?: ReactNode;
+  renderFile?: (file: WorkspaceFileContent) => ReactNode;
+}) {
+  const [searchTerm, setSearchTerm] = useState("");
+  const [browserView, setBrowserView] = useState<"files" | "changes">("files");
+  const [selectedGitPath, setSelectedGitPath] = useState<string>();
+  const git = useWorkspaceGitChanges(projectId, revision, filesRevision);
+  const showChanges = browserView === "changes" && git.data?.available;
+  useEffect(() => { setBrowserView("files"); }, [projectId, openFileRequestId]);
+  useEffect(() => {
+    if (!git.data?.available) return;
+    const items = git.data.changes;
+    setSelectedGitPath((current) => items.some((item) => item.path === current) ? current : items[0]?.path);
+  }, [git.data]);
+  const tree = useMemo(() => workspaceFileTree(files), [files]);
+  const selectedEntry = selectedPath ? files.find((file) => file.path === selectedPath && !file.directory) : undefined;
+  const selectedMedia = selectedEntry && hasMediaType(selectedEntry) ? selectedEntry : undefined;
+  const [treeElement, setTreeElement] = useState<HTMLDivElement | null>(null);
+  const [contextMenu, setContextMenu] = useState<WorkspaceContextMenu>();
+  const [entryDialog, setEntryDialog] = useState<{ kind: "rename" | "file" | "folder"; path: string }>();
+  const [actionError, setActionError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  const codeElement = useRef<HTMLDivElement>(null);
+  const [explorerWidth, setExplorerWidth] = useState(240);
+  const explorerResize = useRef<{ clientX: number; width: number }>(null);
+  const treeSize = useElementSize(treeElement);
+  const fileTree = useRef<TreeApi<WorkspaceFileNode>>(null);
+
+  function finishExplorerResize(): void {
+    explorerResize.current = null;
+  }
+
+  useEffect(() => {
+    const tree = fileTree.current;
+    if (!tree || !selectedPath || !files.some((file) => file.path === selectedPath)) return;
+    let active = true;
+    void tree.scrollTo(selectedPath)?.then(() => { if (active) tree.select(selectedPath, { focus: false }); });
+    return () => { active = false; };
+  }, [files, selectedPath, treeSize.height]);
+
+  async function mutate(operation: () => Promise<WorkspaceFileChange>): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    setActionError(undefined);
+    try { onFilesChanged(await operation()); }
+    catch (cause) { setActionError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  function entryAction(action: WorkspaceEntryAction, entry: WorkspaceContextMenu): void {
+    setContextMenu(undefined);
+    setActionError(undefined);
+    if (!projectId || busy) return;
+    if (action === "rename") { setEntryDialog({ kind: "rename", path: entry.path }); return; }
+    if (action === "new-file" || action === "new-folder") {
+      const parent = entry.directory ? entry.path : entry.path.split("/").slice(0, -1).join("/");
+      setEntryDialog({ kind: action === "new-file" ? "file" : "folder", path: parent });
+      return;
+    }
+    if (action === "copy-path") {
+      void navigator.clipboard.writeText(entry.path).catch((cause) => setActionError(errorMessage(cause)));
+      return;
+    }
+    if (action === "save-library") {
+      void mutate(async () => { await saveProjectAssetToLibrary(projectId, entry.path); return {}; });
+      return;
+    }
+    if (!window.confirm(entry.directory ? t("workspace.confirmDeleteFolder", { path: entry.path }) : t("workspace.confirmDelete", { path: entry.path }))) return;
+    void mutate(async () => { await deleteWorkspaceEntry(projectId, entry.path); return { from: entry.path }; });
+  }
+  if (loading && files.length === 0) return <WorkspaceState loading label={t("workspace.loadingCode")} />;
+  if (error && !selectedPath) return <WorkspaceState error={error} />;
+  return <>
+    <div className="code-view" ref={codeElement} style={{ "--file-explorer-width": `${explorerWidth}px` } as CSSProperties}>
+      <div className="file-explorer">
+        {git.data?.available || git.error ? <div className="file-explorer-views">
+          {git.data?.available ? <nav aria-label={t("workspace.gitViews")}>
+            <button type="button" aria-pressed={!showChanges} onClick={() => setBrowserView("files")}>{t("workspace.gitFiles")}</button>
+            <button type="button" aria-pressed={Boolean(showChanges)} onClick={() => { setBrowserView("changes"); git.refresh(); }}>
+              {t("workspace.gitChanges")}<span className="git-change-count">{git.data.changes.length}</span>
+            </button>
+          </nav> : <span className="git-changes-note" role="alert">{t("workspace.gitFailed")}</span>}
+          <button type="button" className="icon-button" disabled={git.loading} onClick={git.refresh}
+            title={t("workspace.gitRefresh")} aria-label={t("workspace.gitRefresh")}>
+            <RefreshCw size={12} className={git.loading ? "spin" : undefined} />
+          </button>
+        </div> : null}
+        <label className="file-filter">
+          <Search size={13} aria-hidden="true" />
+          <input
+            type="search"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder={t("workspace.filterFiles")}
+            aria-label={t("workspace.filterFilesLabel")}
+          />
+        </label>
+        {actionError ? <p className="file-action-error" role="alert">{actionError}</p> : null}
+        {showChanges ? <GitChangesList data={git.data} loading={git.loading} error={git.error} search={searchTerm}
+          selectedPath={selectedGitPath} onSelect={setSelectedGitPath} /> : <div className="file-tree" ref={setTreeElement} onContextMenu={(event) => {
+          event.preventDefault();
+          if (projectId && !busy) setContextMenu({ path: "", directory: true, x: event.clientX, y: event.clientY });
+        }}>
+          {treeSize.height > 0 ? (
+            <Tree
+              ref={fileTree}
+              data={tree}
+              width={treeSize.width}
+              height={treeSize.height}
+              rowHeight={26}
+              indent={15}
+              openByDefault={false}
+              selection={selectedPath}
+              searchTerm={searchTerm}
+              searchMatch={(node, term) => node.data.name.toLocaleLowerCase().includes(term.toLocaleLowerCase())}
+              disableDrag
+              disableDrop
+              disableEdit
+              disableMultiSelection
+              onActivate={(node) => {
+                if (node.data.path && !node.data.directory) onSelect(node.data.path);
+                else node.toggle();
+              }}
+              aria-label={t("workspace.files")}
+            >
+              {(props) => <WorkspaceTreeNode {...props} onContextMenu={projectId ? (node, event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (busy) return;
+                if (node.data.path && !node.data.directory) onSelect(node.data.path);
+                setContextMenu({
+                  path: node.data.path ?? node.data.id,
+                  directory: Boolean(node.data.directory || !node.isLeaf),
+                  x: event.clientX,
+                  y: event.clientY,
+                });
+              } : undefined} />}
+            </Tree>
+          ) : null}
+        </div>}
+      </div>
+      <div
+        className="file-explorer-resizer"
+        role="separator"
+        aria-label={t("workspace.resizeExplorer")}
+        aria-orientation="vertical"
+        onPointerDown={(event) => {
+          if (!event.isPrimary || event.button !== 0) return;
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          explorerResize.current = { clientX: event.clientX, width: event.currentTarget.previousElementSibling!.getBoundingClientRect().width };
+          setContextMenu(undefined);
+        }}
+        onPointerMove={(event) => {
+          const resize = explorerResize.current;
+          const bounds = codeElement.current?.getBoundingClientRect();
+          if (!resize || !bounds || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+          setExplorerWidth(Math.round(Math.max(140, Math.min(480, bounds.width - 241, resize.width + event.clientX - resize.clientX))));
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+          finishExplorerResize();
+        }}
+        onPointerCancel={finishExplorerResize}
+        onLostPointerCapture={finishExplorerResize}
+      />
+      <div className="file-content">
+        {showChanges && projectId ? <WorkspaceGitDiff key={`${projectId}:${selectedGitPath}`} projectId={projectId} path={selectedGitPath} changes={git.data} />
+          : error ? <WorkspaceState error={error} /> : loading ? <WorkspaceState loading label={t("workspace.loadingFile")} /> : selectedFile ? (
+          <>
+            <div className="file-content-header">
+              <span className="file-content-path" title={selectedFile.path}>{selectedFile.path}{selectedFile.truncated ? " (truncated)" : ""}</span>
+              {fileActions}
+              {onOpenExternal ? <FileOpenActions path={selectedFile.path} onOpen={onOpenExternal} /> : null}
+            </div>
+            {selectedMedia && projectId
+              ? <WorkspaceMediaPreview projectId={projectId} file={selectedMedia} revision={revision} />
+              : selectedFile.binary
+              ? <WorkspaceState label={t("workspace.binaryUnavailable")} />
+              : renderFile ? renderFile(selectedFile)
+              : <HighlightedCode path={selectedFile.path} content={selectedFile.content ?? ""} />}
+          </>
+        ) : <WorkspaceState icon={<FolderOpen size={20} />} label={t("workspace.selectFile")} />}
+      </div>
+    </div>
+    {contextMenu ? <WorkspaceTreeContextMenu menu={contextMenu} file={files.find((file) => file.path === contextMenu.path)} onClose={() => setContextMenu(undefined)} onOpen={onOpenExternal} onAction={(action) => entryAction(action, contextMenu)} /> : null}
+    {entryDialog ? <ProjectRenameDialog title={entryDialog.kind === "rename" ? t("workspace.renameEntry", { name: fileName(entryDialog.path) }) : entryDialog.kind === "file" ? t("workspace.newFile") : t("workspace.newFolder")} name={entryDialog.kind === "rename" ? fileName(entryDialog.path) : ""} returnFocus={null} onClose={() => setEntryDialog(undefined)} onConfirm={(name) => {
+      const entry = entryDialog;
+      setEntryDialog(undefined);
+      if (!projectId || !name.trim()) return;
+      void mutate(async () => {
+        if (entry.kind === "rename") return { from: entry.path, to: (await renameWorkspaceEntry(projectId, entry.path, name)).path };
+        const created = await createWorkspaceEntry(projectId, entry.path, name, entry.kind);
+        return entry.kind === "file" ? { to: created.path } : {};
+      });
+    }} /> : null}
+  </>;
+}
+
+export function WorkspaceCodeView({ projectId, revision, openFileRequest }: { projectId: string; revision: number; openFileRequest?: { path: string; id: number } }) {
+  const [filesRevision, setFilesRevision] = useState(0);
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [selectedPath, setSelectedPath] = useState<string>();
+  const [selectedFile, setSelectedFile] = useState<WorkspaceFileContent>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const request = useRef(0);
+  const handledOpenFileRequest = useRef(openFileRequest?.id);
+
+  useEffect(() => {
+    let disposed = false;
+    const currentRequest = ++request.current;
+    setLoading(true);
+    setError(undefined);
+    void listWorkspaceFiles(projectId).then(async (result) => {
+      if (disposed) return;
+      setFiles(result);
+      if (request.current !== currentRequest) return;
+      const requestedPath = openFileRequest?.path;
+      const nextPath = selectedPath && result.some((file) => file.path === selectedPath)
+        ? selectedPath
+        : requestedPath && result.some((file) => file.path === requestedPath)
+        ? requestedPath
+        : result.find((file) => !file.directory)?.path;
+      setSelectedPath(nextPath);
+      if (!nextPath) {
+        setSelectedFile(undefined);
+        return;
+      }
+      const content = await loadWorkspaceFile(projectId, nextPath, result);
+      if (!disposed && request.current === currentRequest) setSelectedFile(content);
+    }).catch((cause) => {
+      if (!disposed && request.current === currentRequest) setError(errorMessage(cause));
+    }).finally(() => {
+      if (!disposed && request.current === currentRequest) setLoading(false);
+    });
+    return () => { disposed = true; };
+  }, [projectId, revision, filesRevision]);
+
+  async function selectFile(path: string): Promise<void> {
+    const currentRequest = ++request.current;
+    setSelectedPath(path);
+    setSelectedFile(undefined);
+    setLoading(true);
+    setError(undefined);
+    try {
+      const content = await loadWorkspaceFile(projectId, path, files);
+      if (request.current === currentRequest) setSelectedFile(content);
+    } catch (cause) {
+      if (request.current === currentRequest) setError(errorMessage(cause));
+    } finally {
+      if (request.current === currentRequest) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!openFileRequest || handledOpenFileRequest.current === openFileRequest.id) return;
+    handledOpenFileRequest.current = openFileRequest.id;
+    void selectFile(openFileRequest.path);
+  }, [openFileRequest?.id]);
+
+  return <WorkspaceFileBrowser
+    files={files}
+    selectedPath={selectedPath}
+    selectedFile={selectedFile}
+    loading={loading}
+    error={error}
+    onSelect={(path) => void selectFile(path)}
+    projectId={projectId}
+    revision={revision}
+    filesRevision={filesRevision}
+    openFileRequestId={openFileRequest?.id}
+    onFilesChanged={(change) => {
+      request.current += 1;
+      setSelectedPath((current) => workspacePathAfterChange(current, change));
+      setSelectedFile(undefined);
+      setFilesRevision((value) => value + 1);
+    }}
+    onOpenExternal={typeof window !== "undefined" && window.ohMyGameDesktop?.openProjectFile
+      ? (path, mode) => window.ohMyGameDesktop!.openProjectFile(projectId, path, mode)
+      : undefined}
+  />;
+}
+
+function FileOpenActions({ path, onOpen }: { path: string; onOpen: (path: string, mode: ProjectFileOpenMode) => Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const actions = useRef<HTMLDivElement>(null);
+  const platform = typeof window === "undefined" ? "" : window.ohMyGameDesktop?.platform;
+  const options = projectEntryOpenOptions(platform, false);
+  const opener = useProjectEntryOpener(path, onOpen, () => setOpen(false), () => setOpen(true));
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!actions.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="file-open-actions" ref={actions}>
+      <button type="button" disabled={opener.opening} onClick={() => void opener.choose("default")} title={t("workspace.openDefault")} aria-label={t("workspace.openDefaultLabel")}>
+        <ExternalLink size={13} />
+      </button>
+      <button className="file-open-menu-button" type="button" onClick={() => setOpen((value) => !value)} title={t("workspace.chooseOpen")} aria-label={t("workspace.chooseOpenLabel")} aria-expanded={open} aria-haspopup="menu">
+        <ChevronDown size={12} />
+      </button>
+      {open ? (
+        <div className="file-open-menu" role="menu">
+          {options.map(({ mode, label, icon: Icon }) => (
+            <button type="button" role="menuitem" disabled={opener.opening} key={mode} onClick={() => void opener.choose(mode)}><Icon size={13} />{label}</button>
+          ))}
+          {opener.error ? <p className="file-open-error" role="alert">{opener.error}</p> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkspaceTreeContextMenu({ menu, file, onClose, onOpen, onAction }: {
+  menu: WorkspaceContextMenu;
+  file?: WorkspaceFile;
+  onClose: () => void;
+  onOpen?: (path: string, mode: ProjectFileOpenMode) => Promise<void>;
+  onAction: (action: WorkspaceEntryAction) => void;
+}) {
+  const root = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ x: menu.x, y: menu.y });
+  const platform = window.ohMyGameDesktop?.platform;
+  const options = onOpen && menu.path ? projectEntryOpenOptions(platform, menu.directory) : [];
+  const opener = useProjectEntryOpener(menu.path, onOpen, onClose);
+
+  useLayoutEffect(() => {
+    const bounds = root.current?.getBoundingClientRect();
+    if (!bounds) return;
+    setPosition({
+      x: Math.max(6, Math.min(menu.x, window.innerWidth - bounds.width - 6)),
+      y: Math.max(6, Math.min(menu.y, window.innerHeight - bounds.height - 6)),
+    });
+    root.current?.focus();
+  }, [menu.x, menu.y]);
+
+  useEffect(() => {
+    const closeOutside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) onClose();
+    };
+    const closeOnKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    const closeOnLayout = () => onClose();
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("scroll", closeOnLayout, true);
+    window.addEventListener("keydown", closeOnKey);
+    window.addEventListener("resize", closeOnLayout);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("scroll", closeOnLayout, true);
+      window.removeEventListener("keydown", closeOnKey);
+      window.removeEventListener("resize", closeOnLayout);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={root}
+      className="workspace-tree-context-menu"
+      role="menu"
+      aria-label={menu.directory ? t("workspace.folderActions") : t("workspace.fileActions")}
+      tabIndex={-1}
+      style={{ left: position.x, top: position.y }}
+      onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        const items = [...(root.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+        if (!items.length || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const current = items.indexOf(document.activeElement as HTMLButtonElement);
+        const index = current < 0 && event.key === "ArrowUp" ? 0 : current;
+        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }}
+    >
+      <button type="button" role="menuitem" onClick={() => onAction("new-file")}><Plus size={14} /><span>{t("workspace.newFile")}</span></button>
+      <button type="button" role="menuitem" onClick={() => onAction("new-folder")}><FolderPlus size={14} /><span>{t("workspace.newFolder")}</span></button>
+      {menu.path ? <>
+        <hr />
+        <button type="button" role="menuitem" onClick={() => onAction("rename")}><Pencil size={14} /><span>{t("common.rename")}</span></button>
+        <button type="button" role="menuitem" onClick={() => onAction("copy-path")}><Copy size={14} /><span>{t("workspace.copyPath")}</span></button>
+        {file?.mediaType ? <button type="button" role="menuitem" onClick={() => onAction("save-library")}><Layers3 size={14} /><span>{t("workspace.saveToLibrary")}</span></button> : null}
+      </> : null}
+      {options.length ? <hr /> : null}
+      {options.map(({ mode, label, icon: Icon }) => (
+        <button type="button" role="menuitem" disabled={opener.opening} key={mode} onClick={() => void opener.choose(mode)}><Icon size={14} /><span>{label}</span></button>
+      ))}
+      {menu.path ? <><hr /><button type="button" role="menuitem" className="workspace-file-delete" onClick={() => onAction("delete")}><Trash2 size={14} /><span>{t("common.delete")}</span></button></> : null}
+      {opener.error ? <p className="file-open-error" role="alert">{opener.error}</p> : null}
+    </div>,
+    document.body,
+  );
+}
+
+function useProjectEntryOpener(
+  path: string,
+  onOpen: ((path: string, mode: ProjectFileOpenMode) => Promise<void>) | undefined,
+  onOpened: () => void,
+  onFailed?: () => void,
+) {
+  const [opening, setOpening] = useState(false);
+  const [error, setError] = useState<string>();
+
+  async function choose(mode: ProjectFileOpenMode): Promise<void> {
+    if (opening || !onOpen) return;
+    setOpening(true);
+    setError(undefined);
+    try {
+      await onOpen(path, mode);
+      onOpened();
+    } catch (cause) {
+      setError(errorMessage(cause));
+      onFailed?.();
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  return { opening, error, choose };
+}
+
+function projectEntryOpenOptions(platform: string | undefined, directory: boolean): Array<{ mode: ProjectFileOpenMode; label: string; icon: IconComponent }> {
+  const fileManager = platform === "darwin" ? "Finder" : platform === "win32" ? t("workspace.fileExplorer") : t("workspace.fileManager");
+  return [
+    { mode: "default", label: directory ? t("workspace.openIn", { app: fileManager }) : t("workspace.defaultApp"), icon: ExternalLink },
+    { mode: "reveal", label: directory ? t("workspace.showInFolder") : t("workspace.showIn", { app: fileManager }), icon: FolderOpen },
+    { mode: "vscode", label: directory ? t("workspace.openFolderIn", { app: "VS Code" }) : t("workspace.openIn", { app: "VS Code" }), icon: Code2 },
+    { mode: "zed", label: directory ? t("workspace.openFolderIn", { app: "Zed" }) : t("workspace.openIn", { app: "Zed" }), icon: Code2 },
+    ...(!directory && (platform === "darwin" || platform === "win32") ? [{
+      mode: "text-editor" as const,
+      label: t("workspace.openIn", { app: platform === "darwin" ? t("workspace.textEdit") : t("workspace.notepad") }),
+      icon: FileText,
+    }] : []),
+  ];
+}
+
+function WorkspaceMediaPreview({ projectId, file, revision }: {
+  projectId: string;
+  file: WorkspaceFile & { mediaType: NonNullable<WorkspaceFile["mediaType"]> };
+  revision: number;
+}) {
+  const preview = useWorkspaceAssetUrl(projectId, file.path, revision);
+  return (
+    <div className="workspace-media-preview">
+      {!preview.url && !preview.error ? <span className="workspace-media-state"><LoaderCircle className="spin" size={16} />{t("workspace.loadingPreview")}</span> : null}
+      {preview.error ? <span className="workspace-media-state workspace-media-error" role="alert"><X size={16} />{preview.error}</span> : null}
+      {preview.url ? <AssetMedia type={file.mediaType} url={preview.url} label={fileName(file.path)} /> : null}
+    </div>
+  );
+}
+
+function loadWorkspaceFile(projectId: string, filePath: string, files: WorkspaceFile[]): Promise<WorkspaceFileContent> {
+  const file = files.find((candidate) => candidate.path === filePath);
+  if (file?.directory) return Promise.reject(new Error("Path is a directory"));
+  if (file && hasMediaType(file)) {
+    return Promise.resolve({ path: file.path, size: file.size, binary: true });
+  }
+  return getWorkspaceFile(projectId, filePath);
+}
+
+export interface WorkspaceFileNode {
+  id: string;
+  name: string;
+  path?: string;
+  directory?: true;
+  children?: WorkspaceFileNode[];
+}
+
+interface MutableWorkspaceFileNode {
+  id: string;
+  name: string;
+  path?: string;
+  directory?: true;
+  children: Map<string, MutableWorkspaceFileNode>;
+}
+
+export function workspaceFileTree(files: readonly WorkspaceFile[]): WorkspaceFileNode[] {
+  const roots = new Map<string, MutableWorkspaceFileNode>();
+  for (const file of files) {
+    const parts = file.path.split("/").filter(Boolean);
+    let children = roots;
+    let currentPath = "";
+    for (const [index, name] of parts.entries()) {
+      currentPath = currentPath ? `${currentPath}/${name}` : name;
+      let node = children.get(name);
+      if (!node) {
+        node = { id: currentPath, name, children: new Map() };
+        children.set(name, node);
+      }
+      if (index === parts.length - 1) {
+        node.path = file.directory ? undefined : file.path;
+        if (file.directory) node.directory = true;
+      }
+      children = node.children;
+    }
+  }
+  return finalizeWorkspaceNodes(roots);
+}
+
+function finalizeWorkspaceNodes(nodes: Map<string, MutableWorkspaceFileNode>): WorkspaceFileNode[] {
+  return [...nodes.values()]
+    .sort((left, right) => Number(Boolean(left.path)) - Number(Boolean(right.path)) || left.name.localeCompare(right.name))
+    .map((node) => ({
+      id: node.id,
+      name: node.name,
+      ...(node.path ? { path: node.path } : {}),
+      ...(node.directory ? { directory: true as const } : {}),
+      ...(node.directory || node.children.size > 0 ? { children: finalizeWorkspaceNodes(node.children) } : {}),
+    }));
+}
+
+function WorkspaceTreeNode({ node, style, onContextMenu }: NodeRendererProps<WorkspaceFileNode> & {
+  onContextMenu?: (node: NodeRendererProps<WorkspaceFileNode>["node"], event: React.MouseEvent<HTMLDivElement>) => void;
+}) {
+  const folder = Boolean(node.data.directory || !node.isLeaf);
+  const expandable = Boolean(node.data.children?.length);
+  return (
+    <div className={`file-tree-node${node.isSelected ? " file-tree-node-selected" : ""}`} style={style} title={node.id} onContextMenu={(event) => onContextMenu?.(node, event)}>
+      {expandable ? <button
+        className={`file-tree-toggle${node.isOpen ? " file-tree-toggle-open" : ""}`}
+        type="button"
+        tabIndex={-1}
+        aria-label={node.isOpen ? t("workspace.collapse", { name: node.data.name }) : t("workspace.expand", { name: node.data.name })}
+        onClick={(event) => {
+          event.stopPropagation();
+          node.toggle();
+        }}
+      >
+        <ChevronRight size={13} aria-hidden="true" />
+      </button> : <span className="file-tree-spacer" />}
+      {folder ? (
+        node.isOpen
+          ? <FolderOpen className="file-tree-folder-icon" size={14} aria-hidden="true" />
+          : <Folder className="file-tree-folder-icon" size={14} aria-hidden="true" />
+      ) : (
+        <>
+          <FileCode2 className="file-tree-file-icon" size={13} aria-hidden="true" />
+        </>
+      )}
+      <span>{node.data.name}</span>
+    </div>
+  );
+}
+
+function useElementSize(element: HTMLElement | null): { width: number; height: number } {
+  const [size, setSize] = useState({ width: 0, height: 0 });
+  useEffect(() => {
+    if (!element) return;
+    const update = () => setSize({ width: element.clientWidth, height: element.clientHeight });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
+  return size;
+}
+
+export function AssetsView({
+  projectId,
+  files,
+  loading,
+  error,
+  revision,
+  onShowInCode,
+}: {
+  projectId?: string;
+  files: WorkspaceFile[];
+  loading: boolean;
+  error?: string;
+  revision: number;
+  onShowInCode: (path: string) => void;
+}) {
+  const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
+  const [query, setQuery] = useState("");
+  const [selectedPath, setSelectedPath] = useState<string>();
+  const [filters, setFilters] = useState<ProjectAssetFilters>({});
+  const assets = useMemo(() => files.filter(hasMediaType).map((file) => ({ ...file, projectId: projectId ?? "", revision, referenceOnly: file.purpose === "reference" })), [files, projectId, revision]);
+  const visibleAssets = useMemo(() => filterAssets(assets, mediaFilter, query, filters), [assets, mediaFilter, query, filters]);
+  const selectedAsset = assets.find((asset) => asset.path === selectedPath);
+
+  if (loading && files.length === 0) return <WorkspaceState loading label={t("workspace.loadingAssets")} />;
+  if (error) return <WorkspaceState error={error} />;
+  if (!projectId || files.length === 0) return <WorkspaceState icon={<ImageIcon size={20} />} label={t("workspace.noMedia")} />;
+  return (
+    <div className="assets-view">
+      <div className="assets-toolbar">
+        <AssetToolbar mediaFilter={mediaFilter} query={query} onMediaFilterChange={setMediaFilter} onQueryChange={setQuery}>
+          <ProjectAssetCollectionFilters assets={assets} filters={filters} onChange={setFilters} />
+        </AssetToolbar>
+      </div>
+      {visibleAssets.length ? <div className="library-grid assets-grid">{visibleAssets.map((asset) => (
+        <WorkspaceAssetCard key={asset.path} title={fileName(asset.path)} asset={asset} onOpen={() => setSelectedPath(asset.path)} />
+      ))}</div> : <WorkspaceState icon={<ImageIcon size={20} />} label={t("library.noMatch")} />}
+      {selectedAsset ? <WorkspaceAssetDialog
+        asset={selectedAsset}
+        onClose={() => setSelectedPath(undefined)}
+        onShowInCode={() => { setSelectedPath(undefined); onShowInCode(selectedAsset.path); }}
+      /> : null}
+    </div>
+  );
+}
+
+function WorkspaceState({ label, error, loading, icon }: { label?: string; error?: string; loading?: boolean; icon?: React.ReactNode }) {
+  return (
+    <div className={`workspace-state${error ? " error-state" : ""}`} role={error ? "alert" : undefined}>
+      {loading ? <LoaderCircle className="spin" size={20} /> : error ? <X size={20} /> : icon}
+      <span>{error ?? label}</span>
+    </div>
+  );
+}
+
+function PreviewState({ status, error, phase, startedAt }: { status?: ProjectState["preview"]["status"]; error?: string; phase?: ProjectState["preview"]["phase"]; startedAt?: string }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (status !== "starting" || !startedAt) return;
+    const update = () => setElapsed(Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1_000)));
+    update(); const timer = setInterval(update, 1_000); return () => clearInterval(timer);
+  }, [status, startedAt]);
+  switch (status) {
+    case "error": return <WorkspaceState error={error ?? t("workspace.processStopped")} />;
+    case "starting": return <div className="preview-starting" role="status"><LoaderCircle className="spin" size={14} /><span>{t(`workspace.phase.${phase ?? "launching"}`)} · {elapsed}s</span></div>;
+    case "waiting": return error ? <WorkspaceState label={error} /> : <PreviewEmptyState />;
+    case undefined: return <PreviewEmptyState />;
+    case "stopped": case "ready": return null;
+    default: status satisfies never; return null;
+  }
+}
+
+function PreviewLogs({ project, onClose }: { project?: ProjectState; onClose: () => void }) {
+  const preview = project?.preview;
+  return <aside className="preview-logs" aria-label={t("workspace.logs")}>
+    <header><strong>{t("workspace.logs")}</strong><button type="button" onClick={onClose} aria-label={t("workspace.closeLogs")}><X size={14} /></button></header>
+    <p>{preview?.directory ?? project?.startupDirectory ?? "."} · {preview?.command ?? t("workspace.notStarted")}</p>
+    {preview?.manager ? <p>{preview.manager} · {preview.managerSource}</p> : null}
+    <pre>{preview?.logs || preview?.error || t("workspace.noOutput")}</pre>
+    {preview?.diagnostics?.map((diagnostic, index) => <details key={`${diagnostic.client}:${index}`}><summary>{diagnostic.source ?? t("workspace.previewSource")} · {diagnostic.path ?? "/"}</summary><pre>{diagnostic.message}</pre></details>)}
+  </aside>;
+}
+
+function previewRepairPrompt(project: ProjectState | undefined, message: string): string {
+  return `Please diagnose and fix this project's preview error. Preserve the configured runtime and package manager, and verify the result.\n\nStartup directory: ${project?.startupDirectory ?? "."}\nCommand: ${project?.preview.command ?? project?.startupScript ?? "dev"}\n\n${message}\n\nRecent output:\n${project?.preview.logs ?? "(none)"}`;
+}
+
+function previewErrorFile(project: ProjectState | undefined, message: string): string | undefined {
+  const match = message.match(/from ["']([^"']+\.(?:[jt]sx?|css|vue|svelte))["']/) ?? message.match(/(?:^|\n)([^\n]+\.(?:[jt]sx?|css|vue|svelte|html)):\d+/);
+  if (!match) return;
+  const file = match[1].trim().replaceAll("\\", "/");
+  const root = project?.workspacePath.replaceAll("\\", "/");
+  const relative = root && file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file.replace(/^\.\//, "");
+  return relative.startsWith("/") || relative.split("/").includes("..") ? undefined : relative;
+}
+
+function PreviewEmptyState() {
+  return (
+    <div className="preview-empty-state">
+      <div className="preview-empty-mark" aria-hidden="true">
+        <LaptopMinimalistic size={20} />
+      </div>
+      <p className="preview-empty-title">{t("workspace.emptyTitle")}</p>
+      <p className="preview-empty-description">{t("workspace.emptyDescription")}</p>
+    </div>
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

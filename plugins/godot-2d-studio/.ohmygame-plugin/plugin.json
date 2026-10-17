@@ -1,0 +1,11 @@
+{
+  "name": "godot-2d-studio",
+  "version": "0.1.0",
+  "description": "Create and verify Godot 2D games locally and as Web exports.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Godot 2D Studio",
+    "shortDescription": "Create and test Godot 2D games.",
+    "projectTypes": ["godot-game"]
+  }
+}

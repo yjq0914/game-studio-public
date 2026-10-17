@@ -1,0 +1,68 @@
+appId: ai.ohmygame.desktop
+productName: OhMyGame
+asar: true
+beforePack: scripts/prepare-desktop-typebox.mjs
+afterPack: scripts/check-packaged-desktop.mjs
+asarUnpack:
+  - node_modules/esbuild/**/*
+  - node_modules/@esbuild/**/*
+  - dist/player/**/*
+
+directories:
+  output: release
+
+releaseInfo:
+  releaseNotesFile: .runtime/release-notes.md
+
+files:
+  - dist/desktop/**/*.js
+  - dist/desktop/**/*.cjs
+  - dist/daemon/**/*.js
+  - dist/shared/**/*.js
+  - dist/renderer/**/*
+  - dist/player/**/*
+  - "!node_modules/typebox/build/**/*.mjs"
+  - from: .runtime/typebox
+    to: node_modules/typebox/build
+
+extraResources:
+  - from: plugins
+    to: plugins
+  - from: .runtime/preinstalled-plugins
+    to: preinstalled-plugins
+  - from: .runtime/examples
+    to: examples
+  # Match from the parent so electron-builder retains Node's root node_modules.
+  - from: .runtime
+    to: runtime
+    filter:
+      - node/**/*
+  - from: .runtime/desktop-config.json
+    to: desktop-config.json
+
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  notarize: true
+  target:
+    - dmg
+    - zip
+
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+  artifactName: OhMyGame-${version}-${arch}.${ext}
+
+nsis:
+  include: build/installer.nsh
+  deleteAppDataOnUninstall: false
+
+publish:
+  provider: generic
+  url: ${env.DESKTOP_UPDATE_URL}
+  channel: latest
+
+dmg:
+  artifactName: OhMyGame-${version}-${arch}.${ext}

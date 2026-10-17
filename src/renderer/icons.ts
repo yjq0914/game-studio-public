@@ -1,0 +1,220 @@
+import {
+  AddFolderIcon,
+  AddIcon,
+  AltArrowDownIcon,
+  AltArrowLeftIcon,
+  AltArrowRightIcon,
+  ArrowToDownRightIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ArrowUpIcon,
+  BookmarkIcon,
+  BoxIcon,
+  BoxMinimalisticIcon,
+  BranchingPathsDownIcon,
+  ClapperboardIcon,
+  ClipboardIcon,
+  CloseCircleIcon,
+  CloseIcon,
+  Code2Icon,
+  CodeFileIcon,
+  CopyIcon,
+  CursorIcon,
+  DisketteIcon,
+  DownloadIcon,
+  DownloadMinimalisticIcon,
+  FileTextIcon,
+  EyeIcon,
+  SidebarCodeIcon,
+  FlagIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  GamepadIcon,
+  GlobalIcon,
+  GalleryIcon,
+  GalleryRemoveIcon,
+  HistoryIcon,
+  HeartIcon,
+  HomeIcon,
+  InfoCircleIcon,
+  LaptopMinimalisticIcon,
+  LayersIcon,
+  LightbulbIcon,
+  Logout2Icon,
+  MagicWandIcon,
+  MagnifierIcon,
+  MaximizeIcon,
+  MinusIcon,
+  MonitorIcon,
+  MusicNoteIcon,
+  PenIcon,
+  Pen2Icon,
+  PenNewSquareIcon,
+  PauseIcon,
+  PaletteIcon,
+  PlayIcon,
+  PlugCircleIcon,
+  ProgrammingIcon,
+  QuestionCircleIcon,
+  RefreshIcon,
+  RestartIcon,
+  SettingsIcon,
+  ServerIcon,
+  ShareIcon,
+  SidebarMinimalisticIcon,
+  SliderHorizontalIcon,
+  SmartphoneIcon,
+  SortVerticalIcon,
+  SquareArrowRightUpIcon,
+  StarsIcon,
+  StopCircleIcon,
+  TabletIcon,
+  TextSquareIcon,
+  TrashBinTrashIcon,
+  Tuning2Icon,
+  UploadIcon,
+  UndoLeftIcon,
+  UndoRightIcon,
+  UserRoundedIcon,
+  VerifiedCheckIcon,
+  VideoFrameIcon,
+  VideocameraIcon,
+  VolumeCrossIcon,
+  VolumeLoudIcon,
+  WiFiIcon,
+  WiFiOffIcon,
+} from "@solar-icons/react/linear";
+import type { Icon as SolarIcon, IconProps } from "@solar-icons/react/lib/types";
+import { createElement, forwardRef } from "react";
+
+export type IconComponent = SolarIcon;
+
+export const Check = forwardRef<SVGSVGElement, IconProps>(function Check({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("path", { d: "M5 12.5L9.2 16.5L19 7", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round" }));
+});
+
+export const Circle = forwardRef<SVGSVGElement, IconProps>(function Circle({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("circle", { cx: "12", cy: "12", r: "9", stroke: "currentColor", strokeWidth: "1.5" }));
+});
+
+export const CircleDot = forwardRef<SVGSVGElement, IconProps>(function CircleDot({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("circle", { cx: "12", cy: "12", r: "9", stroke: "currentColor", strokeWidth: "1.5" }), createElement("circle", { cx: "12", cy: "12", r: "3", fill: "currentColor" }));
+});
+
+export const Square = forwardRef<SVGSVGElement, IconProps>(function Square({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", ...props }, createElement("rect", { x: "3.5", y: "3.5", width: "17", height: "17", rx: "1.5", fill: "currentColor" }));
+});
+
+export const SendArrow = forwardRef<SVGSVGElement, IconProps>(function SendArrow({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("path", { d: "M12 18V6M7.5 10.5L12 6L16.5 10.5", stroke: "currentColor", strokeWidth: "1.6", strokeLinecap: "round", strokeLinejoin: "round" }));
+});
+
+export const MoreHorizontal = forwardRef<SVGSVGElement, IconProps>(function MoreHorizontal({ size = 24, ...props }, ref) {
+  return createElement(
+    "svg",
+    { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props },
+    [6, 12, 18].map((cx) => createElement("circle", { key: cx, cx, cy: 12, r: 1.8, fill: "currentColor" })),
+  );
+});
+
+export const GripVertical = forwardRef<SVGSVGElement, IconProps>(function GripVertical({ size = 24, ...props }, ref) {
+  return createElement(
+    "svg",
+    { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props },
+    [7, 12, 17].map((cy) => createElement("circle", { key: cy, cx: 12, cy, r: 1.35, fill: "currentColor" })),
+  );
+});
+
+export const Hand = forwardRef<SVGSVGElement, IconProps>(function Hand({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("path", { d: "M18 11V7.5a1.5 1.5 0 0 0-3 0V10m0-2.5V6a1.5 1.5 0 0 0-3 0v4m0-3V5.5a1.5 1.5 0 0 0-3 0V11m0-3.5a1.5 1.5 0 0 0-3 0V13l-1.2-1.2a1.7 1.7 0 0 0-2.4 2.4l4 4A6 6 0 0 0 10.6 20H13a5 5 0 0 0 5-5v-4Z", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round" }));
+});
+
+export const Move = forwardRef<SVGSVGElement, IconProps>(function Move({ size = 24, ...props }, ref) {
+  return createElement("svg", { ref, width: size, height: size, viewBox: "0 0 24 24", fill: "none", ...props }, createElement("path", { d: "M12 3v18M3 12h18M9.5 5.5 12 3l2.5 2.5M9.5 18.5 12 21l2.5-2.5M5.5 9.5 3 12l2.5 2.5M18.5 9.5 21 12l-2.5 2.5", stroke: "currentColor", strokeWidth: "1.5", strokeLinecap: "round", strokeLinejoin: "round" }));
+});
+
+export {
+  AddFolderIcon as FolderPlus,
+  AddIcon as Plus,
+  AltArrowDownIcon as ChevronDown,
+  AltArrowLeftIcon as ChevronLeft,
+  AltArrowRightIcon as ChevronRight,
+  DownloadMinimalisticIcon as ArrowDownToLine,
+  SortVerticalIcon as ArrowDownUp,
+  ArrowToDownRightIcon as CornerDownRight,
+  ArrowLeftIcon as ArrowLeft,
+  ArrowRightIcon as ArrowRight,
+  SquareArrowRightUpIcon as ExternalLink,
+  ArrowUpIcon as ArrowUp,
+  BoxIcon as Box,
+  BoxMinimalisticIcon as Package,
+  BranchingPathsDownIcon as GitBranch,
+  PenNewSquareIcon as MessageSquarePlus,
+  ClapperboardIcon as Clapperboard,
+  ClipboardIcon as Clipboard,
+  CloseCircleIcon as CircleX,
+  CloseIcon as X,
+  Code2Icon as Code2,
+  CodeFileIcon as FileCode2,
+  CopyIcon as Copy,
+  CursorIcon as MousePointer2,
+  DownloadIcon as Download,
+  FileTextIcon as FileText,
+  EyeIcon as Eye,
+  HeartIcon as Heart,
+  SidebarCodeIcon as Columns2,
+  FlagIcon as Flag,
+  FolderIcon as Folder,
+  FolderOpenIcon as FolderOpen,
+  GamepadIcon as Gamepad2,
+  GlobalIcon as Globe2,
+  GalleryIcon as Image,
+  GalleryRemoveIcon as ImageOff,
+  VideoFrameIcon as Film,
+  HistoryIcon as History,
+  HomeIcon as House,
+  InfoCircleIcon as InfoCircle,
+  LayersIcon as Layers3,
+  DisketteIcon as Diskette,
+  LaptopMinimalisticIcon as LaptopMinimalistic,
+  LightbulbIcon as Lightbulb,
+  MaximizeIcon as Maximize,
+  MinusIcon as Minus,
+  MonitorIcon as Monitor,
+  MusicNoteIcon as Music2,
+  PenIcon as Pencil,
+  Pen2Icon as Brush,
+  PenNewSquareIcon as FilePenLine,
+  PauseIcon as Pause,
+  PaletteIcon as Palette,
+  PlayIcon as Play,
+  PlugCircleIcon as Plug,
+  QuestionCircleIcon as CircleHelp,
+  RefreshIcon as LoaderCircle,
+  RefreshIcon as RefreshCw,
+  RestartIcon as RotateCcw,
+  MagnifierIcon as Search,
+  ShareIcon as Share2,
+  SidebarMinimalisticIcon as PanelToggle,
+  SmartphoneIcon as Smartphone,
+  StarsIcon as Sparkles,
+  StopCircleIcon as CircleStop,
+  TabletIcon as Tablet,
+  TextSquareIcon as Type,
+  VolumeCrossIcon as VolumeX,
+  VolumeLoudIcon as Volume2,
+  ProgrammingIcon as Terminal,
+  TrashBinTrashIcon as Trash2,
+  UploadIcon as Upload,
+  UndoLeftIcon as Undo2,
+  UndoRightIcon as Redo2,
+  UserRoundedIcon as UserRound,
+  VideocameraIcon as Video,
+  MagicWandIcon as WandSparkles,
+  WiFiIcon as Wifi,
+  WiFiOffIcon as WifiOff,
+  SettingsIcon as Wrench,
+  SettingsIcon as Settings,
+  Tuning2Icon as SlidersHorizontal,
+  ServerIcon as Server,
+};

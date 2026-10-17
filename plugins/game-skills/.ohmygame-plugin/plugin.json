@@ -1,0 +1,13 @@
+{
+  "name": "game-skills",
+  "version": "0.1.0",
+  "description": "Reviewed Template skeletons and evidence-based Debug experience for Godot creation.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Game Skill",
+    "shortDescription": "Template and Debug experience with source-bound evidence.",
+    "projectTypes": [
+      "godot-game"
+    ]
+  }
+}

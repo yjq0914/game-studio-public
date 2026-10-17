@@ -1,0 +1,126 @@
+import { describe, expect, it } from "vitest";
+import { communityProfileHash, communityHash, conversationHash, DEFAULT_SETTINGS_SECTION, gameHash, parseAppRoute, playtestHash, pluginHash, pluginBuilderHash, projectHash, projectsHash, settingsHash, sidebarHash } from "../src/renderer/routes.js";
+
+describe("renderer routes", () => {
+  it("uses Home as the default route", () => {
+    expect(parseAppRoute("")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/unknown")).toEqual({ page: "home" });
+    for (const page of ["projects", "library", "general", "web-game", "interactive-story", "godot", "asset-canvas"] as const) {
+      expect(parseAppRoute(`#/${page}`)).toEqual({ page });
+      expect(sidebarHash(page)).toBe(`#/${page}`);
+    }
+    expect(sidebarHash("home")).toBe("#/");
+    expect(sidebarHash("community")).toBe("#/community/games");
+    expect(parseAppRoute("#/community")).toEqual({ page: "community" });
+    expect(parseAppRoute("#/community/games")).toEqual({ page: "community" });
+    expect(parseAppRoute("#/community/images")).toEqual({ page: "home" });
+    expect(communityHash()).toBe("#/community/games");
+    expect(parseAppRoute("#/tools")).toEqual({ page: "home" });
+  });
+
+  it("opens creator profiles and rejects malformed profile links", () => {
+    expect(communityProfileHash("user 1")).toBe("#/community/creators/user%201");
+    expect(parseAppRoute(communityProfileHash("user 1"))).toEqual({ page: "community-profile", authorId: "user 1" });
+    expect(parseAppRoute("#/community/creators/%")).toEqual({ page: "home" });
+  });
+
+  it("opens a Studio's project list with its type selected", () => {
+    for (const type of ["general", "web-game", "interactive-story", "godot-game", "asset-canvas"] as const) {
+      expect(parseAppRoute(projectsHash({ projectType: type }))).toEqual({ page: "projects", projectType: type });
+    }
+    expect(parseAppRoute(projectsHash())).toEqual({ page: "projects" });
+    expect(parseAppRoute("#/projects?type=missing")).toEqual({ page: "projects" });
+    expect(parseAppRoute("#/projects?type=%")).toEqual({ page: "projects" });
+  });
+
+  it("restores project searches and sorting from the list address", () => {
+    const hash = projectsHash({ projectType: "web-game", query: "花园 & Forest?", sort: "name" });
+    expect(parseAppRoute(hash)).toEqual({ page: "projects", projectType: "web-game", query: "花园 & Forest?", sort: "name" });
+    expect(projectsHash({ query: "", sort: "updated" })).toBe("#/projects");
+    expect(parseAppRoute("#/projects?type=missing&q=Garden&sort=missing")).toEqual({ page: "projects", query: "Garden" });
+    expect(parseAppRoute("#/projects?q=&sort=updated")).toEqual({ page: "projects" });
+  });
+
+  it("opens plugins within Settings and keeps legacy links working", () => {
+    expect(pluginHash("personal:game tools")).toBe("#/settings/plugins/personal%3Agame%20tools");
+    expect(parseAppRoute(pluginHash("personal:game tools"))).toEqual({ page: "settings", section: "plugins", pluginId: "personal:game tools" });
+    expect(parseAppRoute("#/plugins/personal%3Agame%20tools")).toEqual({ page: "settings", section: "plugins", pluginId: "personal:game tools" });
+    expect(parseAppRoute("#/plugins")).toEqual({ page: "settings", section: "plugins" });
+    expect(parseAppRoute("#/plugins/%")).toEqual({ page: "settings", section: "plugins" });
+    expect(parseAppRoute("#/settings/plugins/%")).toEqual({ page: "settings", section: "plugins" });
+    expect(parseAppRoute("#/plugins/id/extra")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/settings/plugins/id/extra")).toEqual({ page: "home" });
+  });
+
+  it("restores a builder workspace without treating it as a plugin or game project", () => {
+    const sessionId = "1bf8dbe0-438a-488a-b8ec-299829c79561";
+    expect(parseAppRoute(pluginBuilderHash(sessionId))).toEqual({ page: "plugin-builder", sessionId });
+    expect(parseAppRoute("#/plugins/builder/%")).toEqual({ page: "home" });
+    expect(parseAppRoute(`${pluginBuilderHash(sessionId)}/extra`)).toEqual({ page: "home" });
+  });
+
+  it("parses and formats project routes", () => {
+    expect(parseAppRoute("#/projects/project%201")).toEqual({ page: "project", projectId: "project 1" });
+    expect(parseAppRoute("#/projects/project%201/conversations/chat%201")).toEqual({
+      page: "project",
+      projectId: "project 1",
+      conversationId: "chat 1",
+    });
+    expect(projectHash("project 1")).toBe("#/projects/project%201");
+    expect(conversationHash("project 1", "chat 1")).toBe("#/projects/project%201/conversations/chat%201");
+  });
+
+  it("keeps the design view when opening a project or its conversation directly", () => {
+    expect(parseAppRoute(projectHash("project 1", "design"))).toEqual({ page: "project", projectId: "project 1", view: "design" });
+    expect(parseAppRoute(conversationHash("project 1", "chat 1", "design"))).toEqual({ page: "project", projectId: "project 1", conversationId: "chat 1", view: "design" });
+  });
+
+  it("parses and formats Settings routes", () => {
+    expect(DEFAULT_SETTINGS_SECTION).toBe("providers");
+    expect(parseAppRoute("#/settings")).toEqual({ page: "settings", section: "providers" });
+    for (const section of ["account", "billing", "appearance", "providers", "web-search", "network", "plugins", "about"] as const) {
+      expect(parseAppRoute(`#/settings/${section}`)).toEqual({ page: "settings", section });
+      expect(settingsHash(section)).toBe(`#/settings/${section}`);
+    }
+    expect(parseAppRoute("#/settings/connections")).toEqual({ page: "settings", section: "plugins" });
+    expect(parseAppRoute("#/settings/usage")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/settings/plans")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/settings/unknown")).toEqual({ page: "home" });
+  });
+
+  it("parses and formats game routes", () => {
+    expect(parseAppRoute("#/community/games/game%201")).toEqual({ page: "game", gameId: "game 1" });
+    expect(gameHash("game 1")).toBe("#/community/games/game%201");
+  });
+
+  it("parses and formats playtest routes", () => {
+    expect(parseAppRoute("#/playtest/project%201")).toEqual({ page: "playtest", projectId: "project 1" });
+    expect(playtestHash("project 1")).toBe("#/playtest/project%201");
+  });
+
+  it("parses the Node thumbnail route", () => {
+    expect(parseAppRoute("#/thumbnail/project%201/night.carriage")).toEqual({
+      page: "thumbnail",
+      projectId: "project 1",
+      nodeId: "night.carriage",
+    });
+    expect(parseAppRoute("#/thumbnail/project/")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/thumbnail/%/node")).toEqual({ page: "home" });
+  });
+
+  it("rejects malformed project routes", () => {
+    expect(parseAppRoute("#/projects/")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/projects/one/more")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/projects/one/conversations/")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/projects/%")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/games/")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/games/%")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/community/games/%")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/games")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/assets")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/community/assets")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/playtest/project/extra")).toEqual({ page: "home" });
+    expect(parseAppRoute("#/playtest/%")).toEqual({ page: "home" });
+  });
+});

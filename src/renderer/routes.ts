@@ -1,0 +1,179 @@
+import type { ProjectType } from "../shared/contracts.js";
+import { isProjectType } from "../shared/project-runtime.js";
+
+export type SidebarPage =
+  | "home"
+  | "projects"
+  | "library"
+  | "general"
+  | "web-game"
+  | "interactive-story"
+  | "godot"
+  | "asset-canvas"
+  | "community";
+
+export type SettingsSection = "account" | "billing" | "appearance" | "providers" | "web-search" | "network" | "plugins" | "about";
+export type AppNavigationTarget = SidebarPage | "settings";
+export type ProjectSort = "updated" | "name";
+export interface ProjectListFilters {
+  projectType?: ProjectType;
+  query?: string;
+  sort?: ProjectSort;
+}
+type SidebarRoutePage = Exclude<SidebarPage, "community" | "projects">;
+
+export const DEFAULT_SETTINGS_SECTION: SettingsSection = "providers";
+
+const SIDEBAR_PAGES = new Set<SidebarRoutePage>([
+  "home", "library", "general", "web-game", "interactive-story", "godot", "asset-canvas",
+]);
+
+export type AppRoute =
+  | { page: SidebarRoutePage }
+  | ({ page: "projects" } & ProjectListFilters)
+  | { page: "community" }
+  | { page: "community-profile"; authorId: string }
+  | { page: "settings"; section: SettingsSection; pluginId?: string }
+  | { page: "plugin-builder"; sessionId: string }
+  | { page: "game"; gameId: string }
+  | { page: "playtest"; projectId: string }
+  | { page: "thumbnail"; projectId: string; nodeId: string }
+  | { page: "project"; projectId: string; conversationId?: string; view?: "design" };
+
+export function parseAppRoute(hash: string): AppRoute {
+  if (hash === "#/" || hash === "") return { page: "home" };
+  const builderMatch = /^#\/plugins\/builder\/([0-9a-f-]{36})$/.exec(hash);
+  if (builderMatch?.[1]) return { page: "plugin-builder", sessionId: builderMatch[1] };
+  const pluginMatch = /^#\/(?:settings\/)?plugins(?:\/([^/]+))?$/.exec(hash);
+  if (pluginMatch) {
+    try {
+      return { page: "settings", section: "plugins", ...(pluginMatch[1] ? { pluginId: decodeURIComponent(pluginMatch[1]) } : {}) };
+    } catch {
+      return { page: "settings", section: "plugins" };
+    }
+  }
+  const settingsMatch = /^#\/settings(?:\/(account|billing|appearance|providers|web-search|network|connections|about))?$/.exec(hash);
+  if (settingsMatch?.[1] === "connections") return { page: "settings", section: "plugins" };
+  if (settingsMatch) return { page: "settings", section: (settingsMatch[1] as SettingsSection | undefined) ?? DEFAULT_SETTINGS_SECTION };
+  const communityMatch = /^#\/community(?:\/games)?$/.exec(hash);
+  if (communityMatch) return { page: "community" };
+  const profileMatch = /^#\/community\/creators\/([^/]+)$/.exec(hash);
+  if (profileMatch?.[1]) {
+    try { return { page: "community-profile", authorId: decodeURIComponent(profileMatch[1]) }; }
+    catch { return { page: "home" }; }
+  }
+  const projectsMatch = /^#\/projects(?:\?([^#]*))?$/.exec(hash);
+  if (projectsMatch) {
+    const params = new URLSearchParams(projectsMatch[1]);
+    const projectType = params.get("type");
+    const query = params.get("q");
+    const sort = params.get("sort");
+    return {
+      page: "projects",
+      ...(isProjectType(projectType) ? { projectType } : {}),
+      ...(query ? { query } : {}),
+      ...(sort === "name" ? { sort } : {}),
+    };
+  }
+  const sidebarMatch = /^#\/([^/]+)$/.exec(hash);
+  if (sidebarMatch?.[1] && SIDEBAR_PAGES.has(sidebarMatch[1] as SidebarRoutePage)) {
+    return { page: sidebarMatch[1] as SidebarRoutePage };
+  }
+  const gameMatch = /^#\/community\/games\/([^/]+)$/.exec(hash);
+  if (gameMatch?.[1]) {
+    try {
+      return { page: "game", gameId: decodeURIComponent(gameMatch[1]) };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const playtestMatch = /^#\/playtest\/([^/]+)$/.exec(hash);
+  if (playtestMatch?.[1]) {
+    try {
+      return { page: "playtest", projectId: decodeURIComponent(playtestMatch[1]) };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const thumbnailMatch = /^#\/thumbnail\/([^/]+)\/([^/]+)$/.exec(hash);
+  if (thumbnailMatch?.[1] && thumbnailMatch[2]) {
+    try {
+      return {
+        page: "thumbnail",
+        projectId: decodeURIComponent(thumbnailMatch[1]),
+        nodeId: decodeURIComponent(thumbnailMatch[2]),
+      };
+    } catch {
+      return { page: "home" };
+    }
+  }
+  const designMatch = /^#\/projects\/([^/]+)(?:\/conversations\/([^/]+))?\/design$/.exec(hash);
+  const conversationMatch = /^#\/projects\/([^/]+)\/conversations\/([^/]+)$/.exec(hash);
+  const projectMatch = /^#\/projects\/([^/]+)$/.exec(hash);
+  const match = designMatch ?? conversationMatch ?? projectMatch;
+  if (!match?.[1]) return { page: "home" };
+  try {
+    const encodedConversationId = designMatch?.[2] ?? conversationMatch?.[2];
+    return {
+      page: "project",
+      projectId: decodeURIComponent(match[1]),
+      ...(encodedConversationId ? { conversationId: decodeURIComponent(encodedConversationId) } : {}),
+      ...(designMatch ? { view: "design" as const } : {}),
+    };
+  } catch {
+    return { page: "home" };
+  }
+}
+
+export function sidebarHash(page: SidebarPage): string {
+  if (page === "home") return "#/";
+  return page === "community" ? communityHash() : `#/${page}`;
+}
+
+export function settingsHash(section: SettingsSection): string {
+  return `#/settings/${section}`;
+}
+
+export function projectsHash({ projectType, query, sort }: ProjectListFilters = {}): string {
+  const params = new URLSearchParams();
+  if (projectType) params.set("type", projectType);
+  if (query) params.set("q", query);
+  if (sort === "name") params.set("sort", sort);
+  return `#/projects${params.size ? `?${params}` : ""}`;
+}
+
+export function pluginHash(pluginId: string): string {
+  return `#/settings/plugins/${encodeURIComponent(pluginId)}`;
+}
+
+export function pluginBuilderHash(sessionId: string): string {
+  return `#/plugins/builder/${encodeURIComponent(sessionId)}`;
+}
+
+export function projectHash(projectId: string, view?: "design"): string {
+  return `#/projects/${encodeURIComponent(projectId)}${view ? "/design" : ""}`;
+}
+
+export function createdProjectView(type: ProjectType | undefined): "design" | undefined {
+  return type === "general" ? "design" : undefined;
+}
+
+export function conversationHash(projectId: string, conversationId: string, view?: "design"): string {
+  return `${projectHash(projectId)}/conversations/${encodeURIComponent(conversationId)}${view ? "/design" : ""}`;
+}
+
+export function gameHash(gameId: string): string {
+  return `#/community/games/${encodeURIComponent(gameId)}`;
+}
+
+export function communityHash(): string {
+  return "#/community/games";
+}
+
+export function playtestHash(projectId: string): string {
+  return `#/playtest/${encodeURIComponent(projectId)}`;
+}
+
+export function communityProfileHash(authorId: string): string {
+  return `#/community/creators/${encodeURIComponent(authorId)}`;
+}
